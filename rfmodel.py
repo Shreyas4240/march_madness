@@ -477,12 +477,13 @@ def main() -> None:
     print("\nStarting Heavy Fine-Tuning (This might take a few minutes)...")
 
     param_grid = {
-        'n_estimators': [100, 200, 300, 400],
-        'max_depth': [4, 6, 8, None],
-        'min_samples_split': [2, 5, 10],
-        'min_samples_leaf': [1, 2, 4],
-        'max_features': ['sqrt', 'log2', 0.3, 0.5],
-        'bootstrap': [True, False],
+    'n_estimators':      [80, 100, 120, 150],
+    'max_depth':         [3, 4, 5],
+    'min_samples_split': [10, 20, 30],
+    'min_samples_leaf':  [4, 8, 16],
+    'max_features':      ['sqrt', 0.2, 0.3],
+    'max_samples':       [0.6, 0.7, 0.8],
+    'bootstrap':         [True],
     }
 
     rf_base = RandomForestClassifier(random_state=42)
@@ -504,6 +505,46 @@ def main() -> None:
     print(f"Best Parameters Found: {random_search.best_params_}")
 
     model = random_search.best_estimator_
+
+    # --- Learning Curve: n_estimators vs Train/Test Accuracy ---
+    print("\nGenerating n_estimators learning curve...")
+
+    X_test_imputed_lc = np.where(np.isnan(build_matrix(test_years)[0]), col_means[None, :], build_matrix(test_years)[0])
+    Xs_test_lc = standardize_apply(X_test_imputed_lc, mu, sigma)
+    _, y_test_lc = build_matrix(test_years)
+
+    best_params = random_search.best_params_.copy()
+    estimator_range = list(range(10, best_params.get('n_estimators', 200) + 1, 10))
+
+    train_accs, test_accs = [], []
+
+    lc_model = RandomForestClassifier(
+        **{k: v for k, v in best_params.items() if k != 'n_estimators'},
+        warm_start=True,
+        random_state=42,
+        n_jobs=-1
+    )
+
+    for n in estimator_range:
+        lc_model.n_estimators = n
+        lc_model.fit(Xs_train, y_train)
+        train_accs.append(np.mean((lc_model.predict_proba(Xs_train)[:, 1] >= 0.5).astype(int) == y_train))
+        if len(y_test_lc) > 0:
+            test_accs.append(np.mean((lc_model.predict_proba(Xs_test_lc)[:, 1] >= 0.5).astype(int) == y_test_lc))
+
+    if not args.no_plot:
+        fig2, ax2 = plt.subplots(figsize=(10, 5))
+        ax2.plot(estimator_range, [a * 100 for a in train_accs], label="Train Accuracy", color="#1f77b4", linewidth=2)
+        if test_accs:
+            ax2.plot(estimator_range, [a * 100 for a in test_accs], label=f"Test Accuracy ({args.test_year})", color="#d62728", linewidth=2)
+        ax2.axvline(best_params.get('n_estimators', 200), color="gray", linestyle="--", label=f"Best n_estimators={best_params.get('n_estimators', 200)}")
+        ax2.set_xlabel("Number of Trees (n_estimators)")
+        ax2.set_ylabel("Accuracy (%)")
+        ax2.set_title("Random Forest: n_estimators vs Train/Test Accuracy")
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
     
     # Get training probabilities and accuracy using the best model
     p_train = model.predict_proba(Xs_train)[:, 1]
