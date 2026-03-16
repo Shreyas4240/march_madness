@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -161,9 +162,16 @@ def load_team_feature_store(
             acc.setdefault((y, team), []).append(vec)
 
     by_year_team: dict[tuple[int, str], np.ndarray] = {}
+    def _safe_nanmean(M: np.ndarray, axis: int) -> np.ndarray:
+        # Avoid RuntimeWarning spam when a row is all-NaN.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            m = np.nanmean(M, axis=axis)
+        return np.where(np.isfinite(m), m, np.nan)
+
     for k, mats in acc.items():
         M = np.stack(mats, axis=0)
-        by_year_team[k] = np.nanmean(M, axis=0)
+        by_year_team[k] = _safe_nanmean(M, axis=0)
 
     # 3) Historical mean per team
     team_to_year_vecs: dict[str, list[np.ndarray]] = {}
@@ -172,9 +180,35 @@ def load_team_feature_store(
             team_to_year_vecs.setdefault(team, []).append(v)
     by_team_hist_mean: dict[str, np.ndarray] = {}
     for team, vs in team_to_year_vecs.items():
-        by_team_hist_mean[team] = np.nanmean(np.stack(vs, axis=0), axis=0)
+        by_team_hist_mean[team] = _safe_nanmean(np.stack(vs, axis=0), axis=0)
 
     return by_year_team, by_team_hist_mean, feature_names
+
+
+def drop_high_missing_features(
+    by_year_team: dict[tuple[int, str], np.ndarray],
+    by_team_hist_mean: dict[str, np.ndarray],
+    feature_names: list[str],
+    *,
+    max_missing_frac: float = 0.60,
+) -> tuple[dict[tuple[int, str], np.ndarray], dict[str, np.ndarray], list[str]]:
+    """
+    Using "every feature" naively creates tons of near-empty columns (from niche tables).
+    That destabilizes training and yields extreme probabilities. We drop columns that are
+    missing in more than `max_missing_frac` of (year, team) rows.
+    """
+    if not by_year_team:
+        return by_year_team, by_team_hist_mean, feature_names
+    M = np.stack(list(by_year_team.values()), axis=0)  # (n, d)
+    missing_frac = np.mean(np.isnan(M), axis=0)
+    keep = missing_frac <= max_missing_frac
+    keep_idx = np.where(keep)[0]
+    if keep_idx.size == 0:
+        return by_year_team, by_team_hist_mean, feature_names
+    new_names = [feature_names[i] for i in keep_idx.tolist()]
+    new_by_year = {k: v[keep_idx] for k, v in by_year_team.items()}
+    new_by_team = {k: v[keep_idx] for k, v in by_team_hist_mean.items()}
+    return new_by_year, new_by_team, new_names
 
 
 @dataclass(frozen=True)
@@ -423,7 +457,9 @@ def brier_score(p: np.ndarray, y: np.ndarray) -> float:
 
 
 def impute_nan_with_col_means(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    col_means = np.nanmean(X, axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        col_means = np.nanmean(X, axis=0)
     col_means = np.where(np.isfinite(col_means), col_means, 0.0)
     X2 = np.where(np.isnan(X), col_means[None, :], X)
     return X2, col_means
@@ -443,7 +479,10 @@ def _vec_for_team_name(
         parts = [p.strip() for p in team_n.split("/")]
         vals = [by_team_mean[p] for p in parts if p in by_team_mean]
         if vals:
-            return np.nanmean(np.stack(vals, axis=0), axis=0)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                m = np.nanmean(np.stack(vals, axis=0), axis=0)
+            return np.where(np.isfinite(m), m, np.nan)
     return by_team_mean.get(team_n)
 
 
@@ -479,6 +518,9 @@ def main() -> None:
     train_years = list(range(args.train_start_year, args.train_end_year + 1))
 
     by_year_team, by_team_mean, feature_names = load_team_feature_store(DATASET_DIR, years=train_years)
+    by_year_team, by_team_mean, feature_names = drop_high_missing_features(
+        by_year_team, by_team_mean, feature_names, max_missing_frac=0.60
+    )
     z_seeds = load_z_ratings(z_path)
 
     X_list: list[np.ndarray] = []
