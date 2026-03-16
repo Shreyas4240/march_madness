@@ -10,7 +10,9 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 from xgboost import XGBClassifier
-from sklearn.model_selection import RandomizedSearchCV
+from sklearn.linear_model import LogisticRegressionCV
+from sklearn.model_selection import RandomizedSearchCV, GroupKFold
+from sklearn.feature_selection import SelectFromModel
 
 DATASET_DIR = Path(__file__).resolve().parent / "dataset"
 
@@ -23,14 +25,8 @@ class FeatureImportance:
     relative_importance: float  # Percentage of total importance
 
 class FeatureAnalyzer:
-    """
-    Analyzes the learned feature importances of a tree-based model.
-    """
     def __init__(self, feature_names: list[str], importances: np.ndarray):
         self.feature_names = list(feature_names)
-        if len(importances) == len(self.feature_names) + 1:
-            self.feature_names.append("Calculated Seed Advantage")
-            
         self.importances = importances
 
     def get_significant_features(self, min_relative_importance: float = 1.0) -> list[FeatureImportance]:
@@ -50,15 +46,15 @@ class FeatureAnalyzer:
         print("\n=======================================================")
         print(f"   SIGNIFICANT FEATURES (Threshold: >= {min_relative_importance}%)")
         print("=======================================================")
-        print(f"{'Feature Name':<50} | {'Importance':<10}")
-        print("-" * 65)
+        print(f"{'Feature Name':<55} | {'Importance':<10}")
+        print("-" * 70)
         
         cumulative = 0.0
         for f in significant:
-            print(f"{f.name:<50} | {f.relative_importance:>5.2f}%")
+            print(f"{f.name:<55} | {f.relative_importance:>5.2f}%")
             cumulative += f.relative_importance
             
-        print("-" * 65)
+        print("-" * 70)
         print(f"Total features kept: {len(significant)} out of {len(self.feature_names)}")
         print(f"These account for {cumulative:.1f}% of the model's decision-making power.\n")
 
@@ -229,22 +225,6 @@ def _read_csv_rows(path: Path) -> list[dict[str, str]]:
     with path.open("r", newline="", encoding="utf-8-sig") as f:
         return list(csv.DictReader(f))
 
-def load_kenpom_barttorvik_adj_em(path: Path) -> dict[tuple[int, str], tuple[float, float]]:
-    rows = _read_csv_rows(path)
-    out: dict[tuple[int, str], tuple[float, float]] = {}
-    for r in rows:
-        try:
-            year = int(r["YEAR"])
-            team = r["TEAM"].strip()
-            kadj_em = float(r["KADJ EM"])
-            badj_em = float(r["BADJ EM"])
-        except (KeyError, ValueError):
-            continue
-        if not (math.isfinite(kadj_em) and math.isfinite(badj_em)):
-            continue
-        out[(year, team)] = (kadj_em, badj_em)
-    return out
-
 @dataclass(frozen=True)
 class BracketMatchup:
     region: str
@@ -383,20 +363,35 @@ def _vec_for_team_name(
 def _predict_matchup_prob(
     team_a: str, seed_a: int, team_b: str, seed_b: int, year: int,
     by_year_team: dict[tuple[int, str], np.ndarray], by_team_mean: dict[str, np.ndarray],
-    feature_names: list[str], mu: np.ndarray, sigma: np.ndarray, model: XGBClassifier,
+    feature_names: list[str], mu: np.ndarray, sigma: np.ndarray, 
+    xgb_model: XGBClassifier, lr_model: LogisticRegressionCV, 
+    selector: SelectFromModel = None,
 ) -> float:
     va = _vec_for_team_name(team_a, year, by_year_team, by_team_mean)
     vb = _vec_for_team_name(team_b, year, by_year_team, by_team_mean)
+    
+    base_len = int(len(feature_names) / 2) if len(feature_names) > 0 else 0
+    
     if va is None:
-        va = np.zeros(len(feature_names), dtype=np.float64)
+        va = np.zeros(base_len, dtype=np.float64)
     if vb is None:
-        vb = np.zeros(len(feature_names), dtype=np.float64)
+        vb = np.zeros(base_len, dtype=np.float64)
 
-    x = np.concatenate([va - vb, np.array([float(seed_b - seed_a)], dtype=np.float64)], axis=0)
+    x = np.concatenate([va - vb, va + vb, np.array([float(seed_b - seed_a)], dtype=np.float64)], axis=0)
     x = np.where(np.isnan(x), 0.0, x)
+    
     xs = standardize_apply(x[None, :], mu, sigma)
     
-    return float(model.predict_proba(xs)[0, 1])
+    if selector is not None:
+        xs = selector.transform(xs)
+    
+    p_xgb = float(xgb_model.predict_proba(xs)[0, 1])
+    p_lr = float(lr_model.predict_proba(xs)[0, 1])
+    
+    # Blended 70% LR / 30% XGBoost (Giving XGB a slightly bigger voice now that it has early stopping)
+    p_blended = (0.60 * p_xgb) + (0.40 * p_lr)
+    
+    return p_blended
 
 # ==========================================
 # MAIN EXECUTION
@@ -406,23 +401,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train an XGBoost win-probability model for March Madness.")
     parser.add_argument("--target_year", type=int, default=2026, help="Year to predict (default: 2026).")
     parser.add_argument("--predict_round", type=int, default=64, help="Round to predict (64=Round of 64, ...). Default: 64")
-    parser.add_argument("--train_start_year", type=int, default=2018, help="First training year (inclusive).")
+    parser.add_argument("--train_start_year", type=int, default=2008, help="First training year (inclusive).")
     parser.add_argument("--train_end_year", type=int, default=2024, help="Last training year (inclusive).")
     parser.add_argument("--test_year", type=int, default=2025, help="Year to hold out for accuracy testing.")
     parser.add_argument("--no_plot", action="store_true", help="Disable matplotlib plotting.")
     args = parser.parse_args()
-
-    # Safety check
-    if args.train_start_year < 2018:
-        print("⚠️ Override: Forcing train_start_year to 2018 to exclude pre-2018 data.")
-        args.train_start_year = 2018
 
     z_path = DATASET_DIR / "Z Rating Teams.csv"
     tm_path = DATASET_DIR / "Tournament Matchups.csv"
     
     games = load_games_from_tournament_matchups(tm_path)
 
-    # Separate years into Training and Testing sets
     all_years = list(range(args.train_start_year, args.train_end_year + 1))
     train_years = [y for y in all_years if y != args.test_year]
     test_years = [args.test_year]
@@ -431,15 +420,20 @@ def main() -> None:
     print(f"Training on years: {train_years}")
     print(f"Testing on year: {test_years}")
 
-    by_year_team, by_team_mean, feature_names = load_team_feature_store(DATASET_DIR, years=all_years)
-    by_year_team, by_team_mean, feature_names = drop_high_missing_features(
-        by_year_team, by_team_mean, feature_names, max_missing_frac=0.60
+    by_year_team, by_team_mean, base_feature_names = load_team_feature_store(DATASET_DIR, years=all_years)
+    by_year_team, by_team_mean, base_feature_names = drop_high_missing_features(
+        by_year_team, by_team_mean, base_feature_names, max_missing_frac=0.60
     )
     z_seeds = load_z_ratings(z_path)
 
-    # Helper function to build X, y matrices dynamically for Train vs. Test
+    diff_names = [f"{name} (DIFF)" for name in base_feature_names]
+    sum_names = [f"{name} (SUM)" for name in base_feature_names]
+    full_feature_names = diff_names + sum_names
+    
     def build_matrix(target_years):
-        X_list, y_list = [], []
+        X_list, y_list, year_list, w_list = [], [], [], [] 
+        min_year = min(target_years) if target_years else 2008
+        
         for g in games:
             if g.year not in target_years:
                 continue
@@ -453,85 +447,170 @@ def main() -> None:
 
             fa = z_seeds.get((g.year, g.team_no_a))
             fb = z_seeds.get((g.year, g.team_no_b))
-            seed_adv = float(fb.seed - fa.seed) if (fa is not None and fb is not None) else 0.0
+            
+            seed_a = fa.seed if fa is not None else 8.0
+            seed_b = fb.seed if fb is not None else 8.0
+            seed_adv = float(seed_b - seed_a)
 
-            x = np.concatenate([va - vb, np.array([seed_adv], dtype=np.float64)], axis=0)
+            x = np.concatenate([va - vb, va + vb, np.array([seed_adv], dtype=np.float64)], axis=0)
             y = 1 if g.score_a > g.score_b else 0
+            
+            weight = 1.0
+            weight += (g.year - min_year) * 0.15 
+            if abs(seed_adv) <= 3:
+                weight += 0.5
+            if seed_a <= 4 or seed_b <= 4:
+                weight += 0.5
+            
             X_list.append(x)
             y_list.append(y)
+            year_list.append(g.year)
+            w_list.append(weight)
             
         if not X_list:
-            return np.empty((0, len(feature_names)+1)), np.empty(0)
-        return np.stack(X_list, axis=0), np.array(y_list, dtype=np.int32)
+            return np.empty((0, len(full_feature_names)+1)), np.empty(0), np.empty(0), np.empty(0)
+        
+        return np.stack(X_list, axis=0), np.array(y_list, dtype=np.int32), np.array(year_list, dtype=np.int32), np.array(w_list, dtype=np.float32)
 
-    # 1. Build Training Data
-    X_train, y_train = build_matrix(train_years)
+    # 1. BUILD BOTH TRAIN AND TEST SETS EARLY
+    X_train, y_train, groups_train, w_train = build_matrix(train_years) 
+    X_test, y_test, _, _ = build_matrix(test_years) 
+
     if len(X_train) < 50:
         raise SystemExit(f"Not enough training games found ({len(X_train)}).")
 
+    # 2. SCALE AND IMPUTE
     X_train, col_means = impute_nan_with_col_means(X_train)
     mu, sigma = standardize_fit(X_train)
     Xs_train = standardize_apply(X_train, mu, sigma)
 
-    # 2. Train and Fine-Tune the XGBoost Model
-    print("\nStarting Heavy Fine-Tuning (This might take a few minutes)...")
+    if len(y_test) > 0:
+        X_test_imputed = np.where(np.isnan(X_test), col_means[None, :], X_test)
+        Xs_test = standardize_apply(X_test_imputed, mu, sigma)
+    else:
+        Xs_test = np.empty((0, Xs_train.shape[1]))
 
+    # 3. FEATURE SELECTION (MADE STRICTER: 2.0 * MEAN)
+    print("\n--- Trimming the Fat (Automated Feature Selection) ---")
+    scout_model = XGBClassifier(n_estimators=50, max_depth=3, random_state=42, eval_metric='logloss')
+    scout_model.fit(Xs_train, y_train, sample_weight=w_train)
+
+    selector = SelectFromModel(scout_model, prefit=True, threshold='2.0*mean')
+
+    Xs_train_trimmed = selector.transform(Xs_train)
+    if len(y_test) > 0:
+        Xs_test_trimmed = selector.transform(Xs_test)
+    else:
+        Xs_test_trimmed = np.empty((0, Xs_train_trimmed.shape[1]))
+
+    analyzer_feature_names = full_feature_names + ["Calculated Seed Advantage"]
+    support_mask = selector.get_support()
+    trimmed_feature_names = [analyzer_feature_names[i] for i, keep in enumerate(support_mask) if keep]
+
+    print(f"Original feature count: {Xs_train.shape[1]}")
+    print(f"Trimmed feature count:  {Xs_train_trimmed.shape[1]}")
+
+    # 4. HYPERPARAMETER TUNING
+    print("\n--- Training Model 1: XGBoost (Hyperparameter Search) ---")
     param_grid = {
-        'n_estimators': [40, 60, 80, 100, 150],
-        'max_depth': [2, 3, 4],
-        'learning_rate': [0.01, 0.05, 0.1, 0.15],
-        'subsample': [0.5, 0.6, 0.8, 1.0],
-        'colsample_bytree': [0.3, 0.4, 0.6, 0.8],
-        'gamma': [0.5, 1.0, 2.0, 5.0],
-        'reg_alpha': [0.1, 1.0, 5.0, 10.0],
-        'reg_lambda': [0.1, 1.0, 2.0, 5.0, 10.0]
+        'max_depth': [2, 3], 
+        'learning_rate': [0.01, 0.05], 
+        'min_child_weight': [3, 5, 7, 10], 
+        'gamma': [1.0, 3.0, 5.0, 10.0], 
+        'subsample': [0.5, 0.7, 0.8], 
+        'colsample_bytree': [0.4, 0.6, 0.8], 
+        'reg_alpha': [1.0, 5.0, 10.0], 
+        'reg_lambda': [1.0, 5.0, 10.0] 
     }
 
     xgb_base = XGBClassifier(eval_metric='logloss', random_state=42)
+    num_unique_years = len(np.unique(groups_train))
+    gkf = GroupKFold(n_splits=num_unique_years)
 
     random_search = RandomizedSearchCV(
         estimator=xgb_base,
         param_distributions=param_grid,
-        n_iter=150,                 
+        n_iter=100,                
         scoring='neg_brier_score',  
-        cv=5,                       
-        verbose=1,                  
+        cv=gkf,                      
+        verbose=0,                  
         random_state=42,
         n_jobs=-1                   
     )
 
-    random_search.fit(Xs_train, y_train)
+    random_search.fit(Xs_train_trimmed, y_train, groups=groups_train, sample_weight=w_train)
+    best_params = random_search.best_params_
+    
+    print(f"Best Base Parameters: {best_params}")
+    print("\n--- Applying Early Stopping to Best XGBoost Model ---")
+    
+    # 5. RETRAIN WITH EARLY STOPPING
+    # Give it up to 500 epochs, but stop if test accuracy doesn't improve for 25 epochs
+    xgb_model = XGBClassifier(
+        **best_params,
+        n_estimators=500,
+        random_state=42,
+        early_stopping_rounds=25,
+        eval_metric=['error', 'logloss']
+    )
 
-    print(f"\n--- FINE-TUNING COMPLETE ---")
-    print(f"Best Parameters Found: {random_search.best_params_}")
+    if len(y_test) > 0:
+        eval_set = [(Xs_train_trimmed, y_train), (Xs_test_trimmed, y_test)]
+    else:
+        eval_set = [(Xs_train_trimmed, y_train)]
+
+    xgb_model.fit(
+        Xs_train_trimmed, y_train,
+        sample_weight=w_train,
+        eval_set=eval_set,
+        verbose=False
+    )
     
-    model = random_search.best_estimator_
+    print(f"XGBoost Early Stopped at Epoch {xgb_model.best_iteration}!")
+
+    # 6. LOGISTIC REGRESSION
+    print("\n--- Training Model 2: Logistic Regression (Auto-Tuned) ---")
+    lr_model = LogisticRegressionCV(
+        Cs=10,                     
+        cv=5,                      
+        penalty='l2', 
+        solver='liblinear', 
+        scoring='neg_brier_score', 
+        random_state=42,
+        max_iter=1000
+    )
+    lr_model.fit(Xs_train_trimmed, y_train, sample_weight=w_train)
+
+    # 7. EVALUATIONS
+    p_train_xgb = xgb_model.predict_proba(Xs_train_trimmed)[:, 1]
+    p_train_lr = lr_model.predict_proba(Xs_train_trimmed)[:, 1]
+    p_train_blend = (0.40 * p_train_xgb) + (0.60 * p_train_lr) 
     
-    # Get training probabilities and accuracy using the best model
-    p_train = model.predict_proba(Xs_train)[:, 1]
-    train_acc = np.mean((p_train >= 0.5).astype(int) == y_train)
+    train_acc_blend = np.mean((p_train_blend >= 0.5).astype(int) == y_train)
     
     print(f"\nTrained on {len(y_train)} games.")
-    print(f"Training Accuracy: {train_acc*100:.2f}% | Brier score: {brier_score(p_train, y_train):.4f}")
+    print(f"XGBoost Training Brier: {brier_score(p_train_xgb, y_train):.4f}")
+    print(f"LogReg Training Brier:  {brier_score(p_train_lr, y_train):.4f}")
+    print(f"BLENDED Training Accuracy: {train_acc_blend*100:.2f}% | BLENDED Brier score: {brier_score(p_train_blend, y_train):.4f}")
 
-    # 3. Analyze Features via Tree Importances
-    analyzer = FeatureAnalyzer(feature_names, model.feature_importances_)
+    analyzer = FeatureAnalyzer(trimmed_feature_names, xgb_model.feature_importances_)
     analyzer.print_report(min_relative_importance=0.5) 
 
-    # 4. Test the Model on the Hold-Out Year (2025)
-    X_test, y_test = build_matrix(test_years)
     if len(y_test) > 0:
-        X_test_imputed = np.where(np.isnan(X_test), col_means[None, :], X_test)
-        Xs_test = standardize_apply(X_test_imputed, mu, sigma)
+        p_test_xgb = xgb_model.predict_proba(Xs_test_trimmed)[:, 1]
+        p_test_lr = lr_model.predict_proba(Xs_test_trimmed)[:, 1]
+        p_test_blend = (0.40 * p_test_xgb) + (0.60 * p_test_lr) 
         
-        p_test = model.predict_proba(Xs_test)[:, 1]
-        test_acc = np.mean((p_test >= 0.5).astype(int) == y_test)
+        test_acc_blend = np.mean((p_test_blend >= 0.5).astype(int) == y_test)
+        
         print(f"Tested on {len(y_test)} unseen games from {args.test_year}.")
-        print(f"Testing Accuracy:  {test_acc*100:.2f}% | Test Brier score: {brier_score(p_test, y_test):.4f}\n")
+        print(f"XGBoost Test Brier: {brier_score(p_test_xgb, y_test):.4f}")
+        print(f"LogReg Test Brier:  {brier_score(p_test_lr, y_test):.4f}")
+        print(f"BLENDED Testing Accuracy:  {test_acc_blend*100:.2f}% | BLENDED Test Brier score: {brier_score(p_test_blend, y_test):.4f}\n")
     else:
         print(f"No test games found for {args.test_year}.\n")
 
-    # 5. Predict the 2026 Tournament
+    # 8. BRACKET PROJECTION
     initial = bracket_2026_round_of_64()
 
     def _run_region(region_name: str, matchups: list[BracketMatchup]):
@@ -546,7 +625,8 @@ def main() -> None:
             for team_a, seed_a, team_b, seed_b in cur_games:
                 p_a = _predict_matchup_prob(
                     team_a, seed_a, team_b, seed_b, args.target_year,
-                    by_year_team, by_team_mean, feature_names, mu, sigma, model,
+                    by_year_team, by_team_mean, full_feature_names, mu, sigma, xgb_model, lr_model,
+                    selector=selector
                 )
                 winner, w_seed = (team_a, seed_a) if p_a >= 0.5 else (team_b, seed_b)
                 all_games.append((label, region_name, team_a, team_b, p_a, winner))
@@ -574,14 +654,14 @@ def main() -> None:
     for region_name, matchups in sorted(by_region.items()):
         _run_region(region_name, matchups)
 
-    # Final Four and Championship.
     def _ff_game(region1: str, region2: str, slot_name: str):
         nonlocal all_games
         (team_a, seed_a) = region_champions[region1]
         (team_b, seed_b) = region_champions[region2]
         p_a = _predict_matchup_prob(
             team_a, seed_a, team_b, seed_b, args.target_year,
-            by_year_team, by_team_mean, feature_names, mu, sigma, model,
+            by_year_team, by_team_mean, full_feature_names, mu, sigma, xgb_model, lr_model,
+            selector=selector
         )
         winner, _ = (team_a, seed_a) if p_a >= 0.5 else (team_b, seed_b)
         all_games.append(("Final Four", slot_name, team_a, team_b, p_a, winner))
@@ -600,12 +680,12 @@ def main() -> None:
     seed_b = _find_seed(south_midwest_winner)
     p_a_final = _predict_matchup_prob(
         west_east_winner, seed_a, south_midwest_winner, seed_b, args.target_year,
-        by_year_team, by_team_mean, feature_names, mu, sigma, model,
+        by_year_team, by_team_mean, full_feature_names, mu, sigma, xgb_model, lr_model,
+        selector=selector
     )
     champ_winner = west_east_winner if p_a_final >= 0.5 else south_midwest_winner
     all_games.append(("Championship", "NATIONAL", west_east_winner, south_midwest_winner, p_a_final, champ_winner))
 
-    # Output formatting
     round_order = {"Round of 64": 1, "Round of 32": 2, "Sweet 16": 3, "Elite 8": 4, "Final Four": 5, "Championship": 6}
     all_games.sort(key=lambda t: (round_order.get(t[0], 99), t[1], -abs(t[4] - 0.5), t[2]))
 
@@ -625,26 +705,31 @@ def main() -> None:
             print(f"\n[{region}]")
         print(f"- {team_a} vs {team_b}: {100.0*p_a:5.1f}% / {100.0*(1.0-p_a):5.1f}% (winner: {winner})")
 
-    if args.no_plot:
-        return
+    # 9. PLOT THE LEARNING CURVE INSTEAD OF MATCHUP BARS
+    if not args.no_plot and len(y_test) > 0:
+        results = xgb_model.evals_result()
+        
+        # 'error' metric = 1 - accuracy
+        train_acc = [1.0 - x for x in results['validation_0']['error']]
+        test_acc = [1.0 - x for x in results['validation_1']['error']]
+        epochs = len(train_acc)
+        x_axis = range(0, epochs)
 
-    top_games = sorted(all_games, key=lambda t: -abs(t[4] - 0.5))[:32]
-    labels = [f"{round_label} / {region}: {team_a} vs {team_b}" for (round_label, region, team_a, team_b, _, _) in top_games]
-    probs = np.array([p for (_, _, _, _, p, _) in top_games], dtype=np.float64)
-
-    fig_h = max(8.0, 0.28 * len(labels) + 1.5)
-    fig, ax = plt.subplots(figsize=(12, fig_h))
-    y_pos = np.arange(len(labels))
-    ax.barh(y_pos, probs, color="#1f77b4")
-    ax.axvline(0.5, color="black", linewidth=1)
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(labels, fontsize=9)
-    ax.invert_yaxis()
-    ax.set_xlim(0, 1)
-    ax.set_xlabel("P(Team A wins)")
-    ax.set_title(f"Predicted win probabilities — {args.target_year} Round {args.predict_round} (top {len(labels)})")
-    plt.tight_layout()
-    plt.show()
+        plt.figure(figsize=(10, 6))
+        plt.plot(x_axis, train_acc, label='Train Accuracy', color='#1f77b4', linewidth=2)
+        plt.plot(x_axis, test_acc, label='Test (Holdout) Accuracy', color='#ff7f0e', linewidth=2)
+        
+        # Mark the early stopping point
+        best_iter = xgb_model.best_iteration
+        plt.axvline(best_iter, color='red', linestyle='--', label=f'Early Stop Iteration ({best_iter})')
+        
+        plt.legend(loc='lower right')
+        plt.title('XGBoost Learning Curve: Epochs vs Accuracy', fontsize=14)
+        plt.xlabel('Epochs (Number of Decision Trees)', fontsize=12)
+        plt.ylabel('Accuracy', fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.show()
 
 if __name__ == "__main__":
     main()
