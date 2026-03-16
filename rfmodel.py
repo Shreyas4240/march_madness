@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-from xgboost import XGBClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import RandomizedSearchCV
 
 DATASET_DIR = Path(__file__).resolve().parent / "dataset"
@@ -383,7 +383,7 @@ def _vec_for_team_name(
 def _predict_matchup_prob(
     team_a: str, seed_a: int, team_b: str, seed_b: int, year: int,
     by_year_team: dict[tuple[int, str], np.ndarray], by_team_mean: dict[str, np.ndarray],
-    feature_names: list[str], mu: np.ndarray, sigma: np.ndarray, model: XGBClassifier,
+    feature_names: list[str], mu: np.ndarray, sigma: np.ndarray, model: RandomForestClassifier,
 ) -> float:
     va = _vec_for_team_name(team_a, year, by_year_team, by_team_mean)
     vb = _vec_for_team_name(team_b, year, by_year_team, by_team_mean)
@@ -477,34 +477,32 @@ def main() -> None:
     print("\nStarting Heavy Fine-Tuning (This might take a few minutes)...")
 
     param_grid = {
-        'n_estimators': [40, 60, 80, 100, 150],
-        'max_depth': [2, 3, 4],
-        'learning_rate': [0.01, 0.05, 0.1, 0.15],
-        'subsample': [0.5, 0.6, 0.8, 1.0],
-        'colsample_bytree': [0.3, 0.4, 0.6, 0.8],
-        'gamma': [0.5, 1.0, 2.0, 5.0],
-        'reg_alpha': [0.1, 1.0, 5.0, 10.0],
-        'reg_lambda': [0.1, 1.0, 2.0, 5.0, 10.0]
+        'n_estimators': [100, 200, 300, 400],
+        'max_depth': [4, 6, 8, None],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4],
+        'max_features': ['sqrt', 'log2', 0.3, 0.5],
+        'bootstrap': [True, False],
     }
 
-    xgb_base = XGBClassifier(eval_metric='logloss', random_state=42)
+    rf_base = RandomForestClassifier(random_state=42)
 
     random_search = RandomizedSearchCV(
-        estimator=xgb_base,
+        estimator=rf_base,
         param_distributions=param_grid,
-        n_iter=150,                 
-        scoring='neg_brier_score',  
-        cv=5,                       
-        verbose=1,                  
+        n_iter=150,
+        scoring='neg_brier_score',
+        cv=5,
+        verbose=1,
         random_state=42,
-        n_jobs=-1                   
+        n_jobs=-1
     )
 
     random_search.fit(Xs_train, y_train)
 
     print(f"\n--- FINE-TUNING COMPLETE ---")
     print(f"Best Parameters Found: {random_search.best_params_}")
-    
+
     model = random_search.best_estimator_
     
     # Get training probabilities and accuracy using the best model
