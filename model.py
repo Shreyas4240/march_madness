@@ -9,10 +9,63 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-
+from xgboost import XGBClassifier
+from sklearn.model_selection import RandomizedSearchCV
 
 DATASET_DIR = Path(__file__).resolve().parent / "dataset"
 
+# ==========================================
+# FEATURE ANALYZER CLASSES
+# ==========================================
+@dataclass
+class FeatureImportance:
+    name: str
+    relative_importance: float  # Percentage of total importance
+
+class FeatureAnalyzer:
+    """
+    Analyzes the learned feature importances of a tree-based model.
+    """
+    def __init__(self, feature_names: list[str], importances: np.ndarray):
+        self.feature_names = list(feature_names)
+        if len(importances) == len(self.feature_names) + 1:
+            self.feature_names.append("Calculated Seed Advantage")
+            
+        self.importances = importances
+
+    def get_significant_features(self, min_relative_importance: float = 1.0) -> list[FeatureImportance]:
+        total_importance = np.sum(self.importances)
+        
+        importances_list = []
+        for name, imp in zip(self.feature_names, self.importances):
+            rel_imp = (imp / total_importance) * 100 if total_importance > 0 else 0.0
+            importances_list.append(FeatureImportance(name, rel_imp))
+            
+        importances_list.sort(key=lambda x: x.relative_importance, reverse=True)
+        return [f for f in importances_list if f.relative_importance >= min_relative_importance]
+
+    def print_report(self, min_relative_importance: float = 1.0) -> None:
+        significant = self.get_significant_features(min_relative_importance)
+        
+        print("\n=======================================================")
+        print(f"   SIGNIFICANT FEATURES (Threshold: >= {min_relative_importance}%)")
+        print("=======================================================")
+        print(f"{'Feature Name':<50} | {'Importance':<10}")
+        print("-" * 65)
+        
+        cumulative = 0.0
+        for f in significant:
+            print(f"{f.name:<50} | {f.relative_importance:>5.2f}%")
+            cumulative += f.relative_importance
+            
+        print("-" * 65)
+        print(f"Total features kept: {len(significant)} out of {len(self.feature_names)}")
+        print(f"These account for {cumulative:.1f}% of the model's decision-making power.\n")
+
+
+# ==========================================
+# EXISTING HELPER FUNCTIONS
+# ==========================================
 
 def _to_float(s: str) -> float | None:
     s = s.strip()
@@ -23,53 +76,24 @@ def _to_float(s: str) -> float | None:
     except ValueError:
         return None
 
-
 def _normalize_team_name(name: str) -> str:
     return " ".join(name.strip().split())
 
-
 def _looks_like_leak_feature(col: str) -> bool:
-    """
-    "Use every feature" is risky because some files contain tournament outcomes or simulation outputs.
-    We still include a *lot*, but avoid the most direct leakage columns.
-    """
     c = col.strip().upper()
     return c in {
-        "SCORE",
-        "ROUND",
-        "CURRENT ROUND",
-        "CHAMP",
-        "CHAMP%",
-        "F2",
-        "F4",
-        "F4%",
-        "E8",
-        "S16",
-        "R32",
-        "R64",
-        "TOP2",
-        "SIM",
-        "SIMS",
-        "PICK",
-        "PUBLIC",
+        "SCORE", "ROUND", "CURRENT ROUND", "CHAMP", "CHAMP%",
+        "F2", "F4", "F4%", "E8", "S16", "R32", "R64", "TOP2",
+        "SIM", "SIMS", "PICK", "PUBLIC","WINS","HEAT CHECK TOURNAMENT INDEX::WINS",
+        "HEAT CHECK TOURNAMENT INDEX::POOL VALUE","HEAT CHECK TOURNAMENT INDEX::VAL Z-SCORE",
+        "HEAT CHECK TOURNAMENT INDEX::POWER-PATH"
     }
 
-
 def _list_feature_csvs(dataset_dir: Path) -> list[Path]:
-    """
-    Include "team-level" feature tables; exclude obvious outcome/bracket tables.
-    """
     exclude = {
-        "Tournament Matchups.csv",
-        "Tournament Simulation.csv",
-        "Tournament Locations.csv",
-        "Seed Results.csv",
-        "Upset Count.csv",
-        "Upset Seed Info.csv",
-        "Public Picks.csv",
-        "Coach Results.csv",
-        "Conference Results.csv",
-        "Team Results.csv",
+        "Tournament Matchups.csv", "Tournament Simulation.csv", "Tournament Locations.csv",
+        "Seed Results.csv", "Upset Count.csv", "Upset Seed Info.csv", "Public Picks.csv",
+        "Coach Results.csv", "Conference Results.csv", "Team Results.csv",
     }
     paths = []
     for p in sorted(dataset_dir.glob("*.csv")):
@@ -78,26 +102,12 @@ def _list_feature_csvs(dataset_dir: Path) -> list[Path]:
         paths.append(p)
     return paths
 
-
 def load_team_feature_store(
     dataset_dir: Path, *, years: list[int]
 ) -> tuple[dict[tuple[int, str], np.ndarray], dict[str, np.ndarray], list[str]]:
-    """
-    Builds a wide feature matrix by taking *all numeric columns* from the selected dataset CSVs.
-
-    Returns:
-    - by_year_team: (year, team_name) -> feature vector
-    - by_team_hist_mean: team_name -> historical mean feature vector (over provided years)
-    - feature_names: list of feature names aligned to the vectors
-    """
     files = _list_feature_csvs(dataset_dir)
-
-    # 1) Collect union of numeric feature columns per file
-    # We create stable feature names as "<file>::<col>"
     feature_names: list[str] = []
     feature_idx: dict[str, int] = {}
-
-    # Cache rows per file to avoid reread
     file_rows: dict[Path, list[dict[str, str]]] = {p: _read_csv_rows(p) for p in files}
 
     for p, rows in file_rows.items():
@@ -110,7 +120,6 @@ def load_team_feature_store(
                 continue
             if _looks_like_leak_feature(col):
                 continue
-            # consider numeric if at least one row parses
             any_numeric = False
             for r in rows[:200]:
                 v = _to_float(r.get(col, ""))
@@ -128,9 +137,7 @@ def load_team_feature_store(
     if d == 0:
         raise SystemExit("No numeric features discovered in dataset CSVs.")
 
-    # 2) Build vectors: (year, team) -> aggregated (mean) per feature
     acc: dict[tuple[int, str], list[np.ndarray]] = {}
-
     for p, rows in file_rows.items():
         for r in rows:
             y_raw = r.get("YEAR", "")
@@ -163,7 +170,6 @@ def load_team_feature_store(
 
     by_year_team: dict[tuple[int, str], np.ndarray] = {}
     def _safe_nanmean(M: np.ndarray, axis: int) -> np.ndarray:
-        # Avoid RuntimeWarning spam when a row is all-NaN.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             m = np.nanmean(M, axis=axis)
@@ -173,7 +179,6 @@ def load_team_feature_store(
         M = np.stack(mats, axis=0)
         by_year_team[k] = _safe_nanmean(M, axis=0)
 
-    # 3) Historical mean per team
     team_to_year_vecs: dict[str, list[np.ndarray]] = {}
     for (y, team), v in by_year_team.items():
         if y in years:
@@ -184,7 +189,6 @@ def load_team_feature_store(
 
     return by_year_team, by_team_hist_mean, feature_names
 
-
 def drop_high_missing_features(
     by_year_team: dict[tuple[int, str], np.ndarray],
     by_team_hist_mean: dict[str, np.ndarray],
@@ -192,14 +196,9 @@ def drop_high_missing_features(
     *,
     max_missing_frac: float = 0.60,
 ) -> tuple[dict[tuple[int, str], np.ndarray], dict[str, np.ndarray], list[str]]:
-    """
-    Using "every feature" naively creates tons of near-empty columns (from niche tables).
-    That destabilizes training and yields extreme probabilities. We drop columns that are
-    missing in more than `max_missing_frac` of (year, team) rows.
-    """
     if not by_year_team:
         return by_year_team, by_team_hist_mean, feature_names
-    M = np.stack(list(by_year_team.values()), axis=0)  # (n, d)
+    M = np.stack(list(by_year_team.values()), axis=0)
     missing_frac = np.mean(np.isnan(M), axis=0)
     keep = missing_frac <= max_missing_frac
     keep_idx = np.where(keep)[0]
@@ -210,12 +209,10 @@ def drop_high_missing_features(
     new_by_team = {k: v[keep_idx] for k, v in by_team_hist_mean.items()}
     return new_by_year, new_by_team, new_names
 
-
 @dataclass(frozen=True)
 class TeamFeatures:
     seed: float
     z_rating: float
-
 
 @dataclass(frozen=True)
 class Game:
@@ -228,16 +225,11 @@ class Game:
     score_a: float | None
     score_b: float | None
 
-
 def _read_csv_rows(path: Path) -> list[dict[str, str]]:
     with path.open("r", newline="", encoding="utf-8-sig") as f:
         return list(csv.DictReader(f))
 
-
 def load_kenpom_barttorvik_adj_em(path: Path) -> dict[tuple[int, str], tuple[float, float]]:
-    """
-    Returns (KADJ EM, BADJ EM) keyed by (YEAR, TEAM).
-    """
     rows = _read_csv_rows(path)
     out: dict[tuple[int, str], tuple[float, float]] = {}
     for r in rows:
@@ -253,22 +245,6 @@ def load_kenpom_barttorvik_adj_em(path: Path) -> dict[tuple[int, str], tuple[flo
         out[(year, team)] = (kadj_em, badj_em)
     return out
 
-
-def make_program_strength(
-    kenpom: dict[tuple[int, str], tuple[float, float]],
-    *,
-    years: list[int],
-    use: str = "kadj_em",
-) -> dict[str, float]:
-    idx = 0 if use == "kadj_em" else 1
-    acc: dict[str, list[float]] = {}
-    for (y, team), vals in kenpom.items():
-        if y not in years:
-            continue
-        acc.setdefault(team, []).append(vals[idx])
-    return {team: float(np.mean(v)) for team, v in acc.items() if len(v) > 0}
-
-
 @dataclass(frozen=True)
 class BracketMatchup:
     region: str
@@ -277,14 +253,8 @@ class BracketMatchup:
     seed_b: int
     team_b: str
 
-
 def bracket_2026_round_of_64() -> list[BracketMatchup]:
-    """
-    Matchups transcribed from the provided 2026 bracket image.
-    First Four play-in winners are kept as "X/Y" placeholders.
-    """
     return [
-        # EAST
         BracketMatchup("EAST", 1, "Duke", 16, "Siena"),
         BracketMatchup("EAST", 8, "Ohio St.", 9, "TCU"),
         BracketMatchup("EAST", 5, "St. John's", 12, "North Texas"),
@@ -293,7 +263,6 @@ def bracket_2026_round_of_64() -> list[BracketMatchup]:
         BracketMatchup("EAST", 3, "Michigan St.", 14, "North Dakota St."),
         BracketMatchup("EAST", 7, "UCLA", 10, "UCF"),
         BracketMatchup("EAST", 2, "UConn", 15, "Furman"),
-        # SOUTH
         BracketMatchup("SOUTH", 1, "Florida", 16, "Lehigh/PVAMU"),
         BracketMatchup("SOUTH", 8, "Clemson", 9, "Iowa"),
         BracketMatchup("SOUTH", 5, "Vanderbilt", 12, "McNeese St."),
@@ -302,7 +271,6 @@ def bracket_2026_round_of_64() -> list[BracketMatchup]:
         BracketMatchup("SOUTH", 3, "Illinois", 14, "Penn"),
         BracketMatchup("SOUTH", 7, "Saint Mary's", 10, "Texas A&M"),
         BracketMatchup("SOUTH", 2, "Houston", 15, "Idaho"),
-        # WEST
         BracketMatchup("WEST", 1, "Arizona", 16, "Long Island"),
         BracketMatchup("WEST", 8, "Villanova", 9, "Utah St."),
         BracketMatchup("WEST", 5, "Wisconsin", 12, "High Point"),
@@ -311,7 +279,6 @@ def bracket_2026_round_of_64() -> list[BracketMatchup]:
         BracketMatchup("WEST", 3, "Gonzaga", 14, "Kennesaw St."),
         BracketMatchup("WEST", 7, "Miami (FL)", 10, "Missouri"),
         BracketMatchup("WEST", 2, "Purdue", 15, "Queens (N.C.)"),
-        # MIDWEST
         BracketMatchup("MIDWEST", 1, "Michigan", 16, "Howard/UMBC"),
         BracketMatchup("MIDWEST", 8, "Georgia", 9, "Saint Louis"),
         BracketMatchup("MIDWEST", 5, "Texas Tech", 12, "Akron"),
@@ -321,7 +288,6 @@ def bracket_2026_round_of_64() -> list[BracketMatchup]:
         BracketMatchup("MIDWEST", 7, "Kentucky", 10, "Santa Clara"),
         BracketMatchup("MIDWEST", 2, "Iowa St.", 15, "Tennessee St."),
     ]
-
 
 def load_z_ratings(path: Path) -> dict[tuple[int, int], TeamFeatures]:
     rows = _read_csv_rows(path)
@@ -339,16 +305,9 @@ def load_z_ratings(path: Path) -> dict[tuple[int, int], TeamFeatures]:
         out[(year, team_no)] = TeamFeatures(seed=seed, z_rating=z)
     return out
 
-
 def load_games_from_tournament_matchups(path: Path) -> list[Game]:
-    """
-    `Tournament Matchups.csv` is structured as one row per team per game (not a single row per matchup).
-    Within a (YEAR, CURRENT ROUND) block, rows are ordered so that each matchup is two consecutive rows.
-    """
     rows = _read_csv_rows(path)
-
     parsed: list[tuple[int, int, int, str, int, float | None]] = []
-    # (year, current_round, by_year_no, team, team_no, score)
     for r in rows:
         try:
             year = int(r["YEAR"])
@@ -362,9 +321,7 @@ def load_games_from_tournament_matchups(path: Path) -> list[Game]:
             continue
         parsed.append((year, current_round, by_year_no, team, team_no, score))
 
-    # sort to ensure pairing is consistent
     parsed.sort(key=lambda t: (t[0], t[1], -t[2]))
-
     games: list[Game] = []
     i = 0
     while i + 1 < len(parsed):
@@ -375,23 +332,12 @@ def load_games_from_tournament_matchups(path: Path) -> list[Game]:
             continue
         games.append(
             Game(
-                year=year,
-                round_num=rnd,
-                team_a=team_a,
-                team_b=team_b,
-                team_no_a=team_no_a,
-                team_no_b=team_no_b,
-                score_a=score_a,
-                score_b=score_b,
+                year=year, round_num=rnd, team_a=team_a, team_b=team_b,
+                team_no_a=team_no_a, team_no_b=team_no_b, score_a=score_a, score_b=score_b,
             )
         )
         i += 2
     return games
-
-
-def _sigmoid(z: np.ndarray) -> np.ndarray:
-    z = np.clip(z, -35.0, 35.0)
-    return 1.0 / (1.0 + np.exp(-z))
 
 
 def standardize_fit(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -400,61 +346,11 @@ def standardize_fit(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     sigma = np.where(sigma == 0, 1.0, sigma)
     return mu, sigma
 
-
 def standardize_apply(X: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
     return (X - mu) / sigma
 
-
-def make_game_features(
-    game: Game, feats: dict[tuple[int, int], TeamFeatures]
-) -> tuple[np.ndarray, int] | None:
-    fa = feats.get((game.year, game.team_no_a))
-    fb = feats.get((game.year, game.team_no_b))
-    if fa is None or fb is None:
-        return None
-
-    # Features are from A perspective.
-    x = np.array(
-        [
-            fa.z_rating - fb.z_rating,
-            fb.seed - fa.seed,  # positive if A has better (lower) seed
-        ],
-        dtype=np.float64,
-    )
-
-    if game.score_a is None or game.score_b is None:
-        return x, -1
-    if game.score_a == game.score_b:
-        return None
-    y = 1 if game.score_a > game.score_b else 0
-    return x, y
-
-
-def train_logreg_numpy(
-    X: np.ndarray,
-    y: np.ndarray,
-    *,
-    lr: float = 0.1,
-    steps: int = 5000,
-    l2: float = 1e-2,
-) -> tuple[np.ndarray, float]:
-    n, d = X.shape
-    w = np.zeros(d, dtype=np.float64)
-    b = 0.0
-
-    for _ in range(steps):
-        p = _sigmoid(X @ w + b)
-        # gradients
-        grad_w = (X.T @ (p - y)) / n + l2 * w
-        grad_b = float(np.mean(p - y))
-        w -= lr * grad_w
-        b -= lr * grad_b
-    return w, b
-
-
 def brier_score(p: np.ndarray, y: np.ndarray) -> float:
     return float(np.mean((p - y) ** 2))
-
 
 def impute_nan_with_col_means(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     with warnings.catch_warnings():
@@ -464,12 +360,8 @@ def impute_nan_with_col_means(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     X2 = np.where(np.isnan(X), col_means[None, :], X)
     return X2, col_means
 
-
 def _vec_for_team_name(
-    team: str,
-    year: int,
-    by_year_team: dict[tuple[int, str], np.ndarray],
-    by_team_mean: dict[str, np.ndarray],
+    team: str, year: int, by_year_team: dict[tuple[int, str], np.ndarray], by_team_mean: dict[str, np.ndarray],
 ) -> np.ndarray | None:
     team_n = _normalize_team_name(team)
     v = by_year_team.get((year, team_n))
@@ -485,114 +377,260 @@ def _vec_for_team_name(
             return np.where(np.isfinite(m), m, np.nan)
     return by_team_mean.get(team_n)
 
+# ==========================================
+# PREDICTION FUNCTION
+# ==========================================
+def _predict_matchup_prob(
+    team_a: str, seed_a: int, team_b: str, seed_b: int, year: int,
+    by_year_team: dict[tuple[int, str], np.ndarray], by_team_mean: dict[str, np.ndarray],
+    feature_names: list[str], mu: np.ndarray, sigma: np.ndarray, model: XGBClassifier,
+) -> float:
+    va = _vec_for_team_name(team_a, year, by_year_team, by_team_mean)
+    vb = _vec_for_team_name(team_b, year, by_year_team, by_team_mean)
+    if va is None:
+        va = np.zeros(len(feature_names), dtype=np.float64)
+    if vb is None:
+        vb = np.zeros(len(feature_names), dtype=np.float64)
+
+    x = np.concatenate([va - vb, np.array([float(seed_b - seed_a)], dtype=np.float64)], axis=0)
+    x = np.where(np.isnan(x), 0.0, x)
+    xs = standardize_apply(x[None, :], mu, sigma)
+    
+    return float(model.predict_proba(xs)[0, 1])
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train a NumPy win-probability model for March Madness.")
+    parser = argparse.ArgumentParser(description="Train an XGBoost win-probability model for March Madness.")
     parser.add_argument("--target_year", type=int, default=2026, help="Year to predict (default: 2026).")
-    parser.add_argument(
-        "--predict_round",
-        type=int,
-        default=64,
-        help="Round to predict (64=Round of 64, 32=Round of 32, ...). Default: 64",
-    )
-    parser.add_argument("--train_start_year", type=int, default=2021, help="First training year (inclusive).")
+    parser.add_argument("--predict_round", type=int, default=64, help="Round to predict (64=Round of 64, ...). Default: 64")
+    parser.add_argument("--train_start_year", type=int, default=2018, help="First training year (inclusive).")
     parser.add_argument("--train_end_year", type=int, default=2025, help="Last training year (inclusive).")
-    parser.add_argument("--lr", type=float, default=0.1, help="Learning rate.")
-    parser.add_argument("--steps", type=int, default=6000, help="Gradient steps.")
-    parser.add_argument("--l2", type=float, default=1e-2, help="L2 regularization.")
-    parser.add_argument(
-        "--no_plot",
-        action="store_true",
-        help="Disable matplotlib plotting (still prints probabilities).",
-    )
+    parser.add_argument("--test_year", type=int, default=2025, help="Year to hold out for accuracy testing.")
+    parser.add_argument("--no_plot", action="store_true", help="Disable matplotlib plotting.")
     args = parser.parse_args()
+
+    # Safety check
+    if args.train_start_year < 2018:
+        print("⚠️ Override: Forcing train_start_year to 2018 to exclude pre-2018 data.")
+        args.train_start_year = 2018
 
     z_path = DATASET_DIR / "Z Rating Teams.csv"
     tm_path = DATASET_DIR / "Tournament Matchups.csv"
-    kp_path = DATASET_DIR / "KenPom Barttorvik.csv"
-
-    # (Legacy) KenPom AdjEM loader; kept for reference.
-    _ = load_kenpom_barttorvik_adj_em(kp_path)
+    
     games = load_games_from_tournament_matchups(tm_path)
 
-    train_years = list(range(args.train_start_year, args.train_end_year + 1))
+    # Separate years into Training and Testing sets
+    all_years = list(range(args.train_start_year, args.train_end_year + 1))
+    train_years = [y for y in all_years if y != args.test_year]
+    test_years = [args.test_year]
 
-    by_year_team, by_team_mean, feature_names = load_team_feature_store(DATASET_DIR, years=train_years)
+    print(f"Loading features...")
+    print(f"Training on years: {train_years}")
+    print(f"Testing on year: {test_years}")
+
+    by_year_team, by_team_mean, feature_names = load_team_feature_store(DATASET_DIR, years=all_years)
     by_year_team, by_team_mean, feature_names = drop_high_missing_features(
         by_year_team, by_team_mean, feature_names, max_missing_frac=0.60
     )
     z_seeds = load_z_ratings(z_path)
 
-    X_list: list[np.ndarray] = []
-    y_list: list[int] = []
-    for g in games:
-        if g.year not in train_years:
-            continue
-        if g.score_a is None or g.score_b is None or g.score_a == g.score_b:
-            continue
+    # Helper function to build X, y matrices dynamically for Train vs. Test
+    def build_matrix(target_years):
+        X_list, y_list = [], []
+        for g in games:
+            if g.year not in target_years:
+                continue
+            if g.score_a is None or g.score_b is None or g.score_a == g.score_b:
+                continue
 
-        va = _vec_for_team_name(g.team_a, g.year, by_year_team, by_team_mean)
-        vb = _vec_for_team_name(g.team_b, g.year, by_year_team, by_team_mean)
-        if va is None or vb is None:
-            continue
+            va = _vec_for_team_name(g.team_a, g.year, by_year_team, by_team_mean)
+            vb = _vec_for_team_name(g.team_b, g.year, by_year_team, by_team_mean)
+            if va is None or vb is None:
+                continue
 
-        fa = z_seeds.get((g.year, g.team_no_a))
-        fb = z_seeds.get((g.year, g.team_no_b))
-        seed_adv = float(fb.seed - fa.seed) if (fa is not None and fb is not None) else 0.0
+            fa = z_seeds.get((g.year, g.team_no_a))
+            fb = z_seeds.get((g.year, g.team_no_b))
+            seed_adv = float(fb.seed - fa.seed) if (fa is not None and fb is not None) else 0.0
 
-        x = np.concatenate([va - vb, np.array([seed_adv], dtype=np.float64)], axis=0)
-        y = 1 if g.score_a > g.score_b else 0
-        X_list.append(x)
-        y_list.append(y)
+            x = np.concatenate([va - vb, np.array([seed_adv], dtype=np.float64)], axis=0)
+            y = 1 if g.score_a > g.score_b else 0
+            X_list.append(x)
+            y_list.append(y)
+            
+        if not X_list:
+            return np.empty((0, len(feature_names)+1)), np.empty(0)
+        return np.stack(X_list, axis=0), np.array(y_list, dtype=np.int32)
 
-    if len(X_list) < 200:
-        raise SystemExit(f"Not enough training games found ({len(X_list)}).")
+    # 1. Build Training Data
+    X_train, y_train = build_matrix(train_years)
+    if len(X_train) < 50:
+        raise SystemExit(f"Not enough training games found ({len(X_train)}).")
 
-    X = np.stack(X_list, axis=0)
-    y = np.array(y_list, dtype=np.float64)
+    X_train, col_means = impute_nan_with_col_means(X_train)
+    mu, sigma = standardize_fit(X_train)
+    Xs_train = standardize_apply(X_train, mu, sigma)
 
-    X, _ = impute_nan_with_col_means(X)
-    mu, sigma = standardize_fit(X)
-    Xs = standardize_apply(X, mu, sigma)
+    # 2. Train and Fine-Tune the XGBoost Model
+    print("\nStarting Heavy Fine-Tuning (This might take a few minutes)...")
 
-    w, b = train_logreg_numpy(Xs, y, lr=args.lr, steps=args.steps, l2=args.l2)
-    p_train = _sigmoid(Xs @ w + b)
-    print(f"Trained on {len(y)} games (years {args.train_start_year}-{args.train_end_year}).")
-    print(f"Train Brier score: {brier_score(p_train, y):.4f}")
-    print(f"Weights (standardized): {w}, bias: {b:.3f}")
+    param_grid = {
+        'n_estimators': [40, 60, 80, 100, 150],
+        'max_depth': [2, 3, 4],
+        'learning_rate': [0.01, 0.05, 0.1, 0.15],
+        'subsample': [0.5, 0.6, 0.8, 1.0],
+        'colsample_bytree': [0.3, 0.4, 0.6, 0.8],
+        'gamma': [0.5, 1.0, 2.0, 5.0],
+        'reg_alpha': [0.1, 1.0, 5.0, 10.0],
+        'reg_lambda': [0.1, 1.0, 2.0, 5.0, 10.0]
+    }
 
-    rows_out: list[tuple[str, str, float, str]] = []
-    for m in bracket_2026_round_of_64():
-        va = _vec_for_team_name(m.team_a, args.target_year, by_year_team, by_team_mean)
-        vb = _vec_for_team_name(m.team_b, args.target_year, by_year_team, by_team_mean)
-        if va is None:
-            va = np.zeros(len(feature_names), dtype=np.float64)
-        if vb is None:
-            vb = np.zeros(len(feature_names), dtype=np.float64)
+    xgb_base = XGBClassifier(eval_metric='logloss', random_state=42)
 
-        x = np.concatenate([va - vb, np.array([float(m.seed_b - m.seed_a)], dtype=np.float64)], axis=0)
-        x = np.where(np.isnan(x), 0.0, x)
-        xs = standardize_apply(x[None, :], mu, sigma)
-        p_a = float(_sigmoid(xs @ w + b)[0])
-        rows_out.append((m.team_a, m.team_b, p_a, m.region))
+    random_search = RandomizedSearchCV(
+        estimator=xgb_base,
+        param_distributions=param_grid,
+        n_iter=150,                 
+        scoring='neg_brier_score',  
+        cv=5,                       
+        verbose=1,                  
+        random_state=42,
+        n_jobs=-1                   
+    )
 
-    rows_out.sort(key=lambda t: (t[3], -abs(t[2] - 0.5), t[0]))
+    random_search.fit(Xs_train, y_train)
 
-    print("\n2026 Round of 64 — predicted win% (Team A vs Team B):")
+    print(f"\n--- FINE-TUNING COMPLETE ---")
+    print(f"Best Parameters Found: {random_search.best_params_}")
+    
+    model = random_search.best_estimator_
+    
+    # Get training probabilities and accuracy using the best model
+    p_train = model.predict_proba(Xs_train)[:, 1]
+    train_acc = np.mean((p_train >= 0.5).astype(int) == y_train)
+    
+    print(f"\nTrained on {len(y_train)} games.")
+    print(f"Training Accuracy: {train_acc*100:.2f}% | Brier score: {brier_score(p_train, y_train):.4f}")
+
+    # 3. Analyze Features via Tree Importances
+    analyzer = FeatureAnalyzer(feature_names, model.feature_importances_)
+    analyzer.print_report(min_relative_importance=0.5) 
+
+    # 4. Test the Model on the Hold-Out Year (2025)
+    X_test, y_test = build_matrix(test_years)
+    if len(y_test) > 0:
+        X_test_imputed = np.where(np.isnan(X_test), col_means[None, :], X_test)
+        Xs_test = standardize_apply(X_test_imputed, mu, sigma)
+        
+        p_test = model.predict_proba(Xs_test)[:, 1]
+        test_acc = np.mean((p_test >= 0.5).astype(int) == y_test)
+        print(f"Tested on {len(y_test)} unseen games from {args.test_year}.")
+        print(f"Testing Accuracy:  {test_acc*100:.2f}% | Test Brier score: {brier_score(p_test, y_test):.4f}\n")
+    else:
+        print(f"No test games found for {args.test_year}.\n")
+
+    # 5. Predict the 2026 Tournament
+    initial = bracket_2026_round_of_64()
+
+    def _run_region(region_name: str, matchups: list[BracketMatchup]):
+        nonlocal all_games, region_champions
+        cur_games: list[tuple[str, int, str, int]] = [(m.team_a, m.seed_a, m.team_b, m.seed_b) for m in matchups]
+        round_labels = ["Round of 64", "Round of 32", "Sweet 16", "Elite 8"]
+        round_idx = 0
+
+        while True:
+            label = round_labels[round_idx] if round_idx < len(round_labels) else f"Round {round_idx+1}"
+            winners: list[tuple[str, int]] = []
+            for team_a, seed_a, team_b, seed_b in cur_games:
+                p_a = _predict_matchup_prob(
+                    team_a, seed_a, team_b, seed_b, args.target_year,
+                    by_year_team, by_team_mean, feature_names, mu, sigma, model,
+                )
+                winner, w_seed = (team_a, seed_a) if p_a >= 0.5 else (team_b, seed_b)
+                all_games.append((label, region_name, team_a, team_b, p_a, winner))
+                winners.append((winner, w_seed))
+
+            if len(winners) == 1:
+                region_champions[region_name] = winners[0]
+                break
+
+            next_games: list[tuple[str, int, str, int]] = []
+            for i in range(0, len(winners), 2):
+                (ta, sa) = winners[i]
+                (tb, sb) = winners[i + 1]
+                next_games.append((ta, sa, tb, sb))
+            cur_games = next_games
+            round_idx += 1
+
+    all_games: list[tuple[str, str, str, str, float, str]] = []
+    region_champions: dict[str, tuple[str, int]] = {}
+    by_region: dict[str, list[BracketMatchup]] = {}
+    
+    for m in initial:
+        by_region.setdefault(m.region, []).append(m)
+
+    for region_name, matchups in sorted(by_region.items()):
+        _run_region(region_name, matchups)
+
+    # Final Four and Championship.
+    def _ff_game(region1: str, region2: str, slot_name: str):
+        nonlocal all_games
+        (team_a, seed_a) = region_champions[region1]
+        (team_b, seed_b) = region_champions[region2]
+        p_a = _predict_matchup_prob(
+            team_a, seed_a, team_b, seed_b, args.target_year,
+            by_year_team, by_team_mean, feature_names, mu, sigma, model,
+        )
+        winner, _ = (team_a, seed_a) if p_a >= 0.5 else (team_b, seed_b)
+        all_games.append(("Final Four", slot_name, team_a, team_b, p_a, winner))
+        return winner
+
+    west_east_winner = _ff_game("EAST", "WEST", "EAST/WEST")
+    south_midwest_winner = _ff_game("SOUTH", "MIDWEST", "SOUTH/MIDWEST")
+
+    def _find_seed(team_name: str) -> int:
+        for _, (t, s) in region_champions.items():
+            if t == team_name:
+                return s
+        return 1
+
+    seed_a = _find_seed(west_east_winner)
+    seed_b = _find_seed(south_midwest_winner)
+    p_a_final = _predict_matchup_prob(
+        west_east_winner, seed_a, south_midwest_winner, seed_b, args.target_year,
+        by_year_team, by_team_mean, feature_names, mu, sigma, model,
+    )
+    champ_winner = west_east_winner if p_a_final >= 0.5 else south_midwest_winner
+    all_games.append(("Championship", "NATIONAL", west_east_winner, south_midwest_winner, p_a_final, champ_winner))
+
+    # Output formatting
+    round_order = {"Round of 64": 1, "Round of 32": 2, "Sweet 16": 3, "Elite 8": 4, "Final Four": 5, "Championship": 6}
+    all_games.sort(key=lambda t: (round_order.get(t[0], 99), t[1], -abs(t[4] - 0.5), t[2]))
+
+    print(f"=======================================================")
+    print(f"   PREDICTING THE FULL {args.target_year} TOURNAMENT")
+    print(f"=======================================================")
+    
+    cur_round = None
     cur_region = None
-    for a, b_name, p_a, region in rows_out:
+    for round_label, region, team_a, team_b, p_a, winner in all_games:
+        if round_label != cur_round:
+            cur_round = round_label
+            cur_region = None
+            print(f"\n=== {round_label} ===")
         if region != cur_region:
             cur_region = region
             print(f"\n[{region}]")
-        print(f"- {a} vs {b_name}: {100.0*p_a:5.1f}% / {100.0*(1.0-p_a):5.1f}%")
+        print(f"- {team_a} vs {team_b}: {100.0*p_a:5.1f}% / {100.0*(1.0-p_a):5.1f}% (winner: {winner})")
 
     if args.no_plot:
         return
 
-    # Simple visualization: strongest edges first
-    top = rows_out[:32]
-    labels = [f"{region}: {a} vs {b_name}" for a, b_name, _, region in top]
-    probs = np.array([p for _, _, p, _ in top], dtype=np.float64)
+    top_games = sorted(all_games, key=lambda t: -abs(t[4] - 0.5))[:32]
+    labels = [f"{round_label} / {region}: {team_a} vs {team_b}" for (round_label, region, team_a, team_b, _, _) in top_games]
+    probs = np.array([p for (_, _, _, _, p, _) in top_games], dtype=np.float64)
 
     fig_h = max(8.0, 0.28 * len(labels) + 1.5)
     fig, ax = plt.subplots(figsize=(12, fig_h))
@@ -607,7 +645,6 @@ def main() -> None:
     ax.set_title(f"Predicted win probabilities — {args.target_year} Round {args.predict_round} (top {len(labels)})")
     plt.tight_layout()
     plt.show()
-
 
 if __name__ == "__main__":
     main()
