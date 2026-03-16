@@ -103,7 +103,7 @@ def _list_feature_csvs(dataset_dir: Path) -> list[Path]:
     return paths
 
 def load_team_feature_store(
-    dataset_dir: Path, *, years: list[int]
+    dataset_dir: Path, *, years: list[int], hist_years: list[int]
 ) -> tuple[dict[tuple[int, str], np.ndarray], dict[str, np.ndarray], list[str]]:
     files = _list_feature_csvs(dataset_dir)
     feature_names: list[str] = []
@@ -179,10 +179,13 @@ def load_team_feature_store(
         M = np.stack(mats, axis=0)
         by_year_team[k] = _safe_nanmean(M, axis=0)
 
+    # Build historical means using ONLY the specified hist_years to avoid
+    # leaking future seasons into earlier training examples.
     team_to_year_vecs: dict[str, list[np.ndarray]] = {}
     for (y, team), v in by_year_team.items():
-        if y in years:
+        if y in hist_years:
             team_to_year_vecs.setdefault(team, []).append(v)
+
     by_team_hist_mean: dict[str, np.ndarray] = {}
     for team, vs in team_to_year_vecs.items():
         by_team_hist_mean[team] = _safe_nanmean(np.stack(vs, axis=0), axis=0)
@@ -407,7 +410,7 @@ def main() -> None:
     parser.add_argument("--target_year", type=int, default=2026, help="Year to predict (default: 2026).")
     parser.add_argument("--predict_round", type=int, default=64, help="Round to predict (64=Round of 64, ...). Default: 64")
     parser.add_argument("--train_start_year", type=int, default=2018, help="First training year (inclusive).")
-    parser.add_argument("--train_end_year", type=int, default=2025, help="Last training year (inclusive).")
+    parser.add_argument("--train_end_year", type=int, default=2024, help="Last training year (inclusive).")
     parser.add_argument("--test_year", type=int, default=2025, help="Year to hold out for accuracy testing.")
     parser.add_argument("--no_plot", action="store_true", help="Disable matplotlib plotting.")
     args = parser.parse_args()
@@ -431,7 +434,7 @@ def main() -> None:
     print(f"Training on years: {train_years}")
     print(f"Testing on year: {test_years}")
 
-    by_year_team, by_team_mean, feature_names = load_team_feature_store(DATASET_DIR, years=all_years)
+    by_year_team, by_team_mean, feature_names = load_team_feature_store(DATASET_DIR, years=all_years, hist_years=train_years)
     by_year_team, by_team_mean, feature_names = drop_high_missing_features(
         by_year_team, by_team_mean, feature_names, max_missing_frac=0.60
     )
@@ -477,12 +480,12 @@ def main() -> None:
     print("\nStarting Heavy Fine-Tuning (This might take a few minutes)...")
 
     param_grid = {
-    'n_estimators':      [80, 100, 120, 150],
-    'max_depth':         [3, 4, 5],
-    'min_samples_split': [10, 20, 30],
-    'min_samples_leaf':  [4, 8, 16],
-    'max_features':      ['sqrt', 0.2, 0.3],
-    'max_samples':       [0.6, 0.7, 0.8],
+    'n_estimators':      [100, 150, 200],          # stable, keep
+    'max_depth':         [3, 4, 5],                # back down, 6-10 was too deep
+    'min_samples_split': [15, 20, 30, 40],         # back up, need to block spurious splits
+    'min_samples_leaf':  [8, 12, 16, 20],          # back up significantly
+    'max_features':      ['sqrt', 0.2, 0.25, 0.3], # back down, high feature access = memorization
+    'max_samples':       [0.5, 0.6, 0.7],          # back down, less data per tree = less memorization
     'bootstrap':         [True],
     }
 

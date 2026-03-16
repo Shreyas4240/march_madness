@@ -407,7 +407,7 @@ def main() -> None:
     parser.add_argument("--target_year", type=int, default=2026, help="Year to predict (default: 2026).")
     parser.add_argument("--predict_round", type=int, default=64, help="Round to predict (64=Round of 64, ...). Default: 64")
     parser.add_argument("--train_start_year", type=int, default=2018, help="First training year (inclusive).")
-    parser.add_argument("--train_end_year", type=int, default=2025, help="Last training year (inclusive).")
+    parser.add_argument("--train_end_year", type=int, default=2024, help="Last training year (inclusive).")
     parser.add_argument("--test_year", type=int, default=2025, help="Year to hold out for accuracy testing.")
     parser.add_argument("--no_plot", action="store_true", help="Disable matplotlib plotting.")
     args = parser.parse_args()
