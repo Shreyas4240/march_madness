@@ -81,13 +81,30 @@ def _normalize_team_name(name: str) -> str:
 
 def _looks_like_leak_feature(col: str) -> bool:
     c = col.strip().upper()
-    return c in {
+
+    # Explicit leak/outcome columns
+    if c in {
         "SCORE", "ROUND", "CURRENT ROUND", "CHAMP", "CHAMP%",
         "F2", "F4", "F4%", "E8", "S16", "R32", "R64", "TOP2",
-        "SIM", "SIMS", "PICK", "PUBLIC","WINS","HEAT CHECK TOURNAMENT INDEX::WINS",
-        "HEAT CHECK TOURNAMENT INDEX::POOL VALUE","HEAT CHECK TOURNAMENT INDEX::VAL Z-SCORE",
-        "HEAT CHECK TOURNAMENT INDEX::POWER-PATH"
-    }
+        "SIM", "SIMS", "PICK", "PUBLIC", "WINS",
+        "SEED",
+        # Season record — directly encodes team strength in a target-leaky way
+        "W", "L", "WIN%", "GAMES",
+        # ID/lookup columns, not predictive features
+        "QUAD NO", "QUAD ID", "TEAM ID",
+        "HEAT CHECK TOURNAMENT INDEX::WINS",
+        "HEAT CHECK TOURNAMENT INDEX::POOL VALUE",
+        "HEAT CHECK TOURNAMENT INDEX::VAL Z-SCORE",
+        "HEAT CHECK TOURNAMENT INDEX::POWER-PATH",
+    }:
+        return True
+
+    # Block ALL rank columns regardless of prefix format
+    # Catches: "KADJ EM RANK", "KO RANK", "KD RANK", "BADJT RANK", etc.
+    if "RANK" in c:
+        return True
+
+    return False
 
 def _list_feature_csvs(dataset_dir: Path) -> list[Path]:
     exclude = {
@@ -401,146 +418,214 @@ def _predict_matchup_prob(
     
     return float(model.predict_proba(xs)[0, 1])
 
+def boost_priority_features(
+    by_year_team: dict[tuple[int, str], np.ndarray],
+    by_team_hist_mean: dict[str, np.ndarray],
+    feature_names: list[str],
+    *,
+    priority_keywords: list[str],
+    multiplier: int = 3,
+) -> tuple[dict[tuple[int, str], np.ndarray], dict[str, np.ndarray], list[str]]:
+    """
+    Duplicates high-signal features `multiplier` times so tree splits
+    favour them proportionally more during random feature sampling.
+    """
+    boost_idx = [
+        i for i, name in enumerate(feature_names)
+        if any(kw.lower() in name.lower() for kw in priority_keywords)
+    ]
+    if not boost_idx:
+        print("⚠️  No priority features found to boost — check keywords.")
+        return by_year_team, by_team_hist_mean, feature_names
+
+    extra_names = []
+    for _ in range(multiplier - 1):
+        extra_names += [f"{feature_names[i]}__boosted" for i in boost_idx]
+
+    new_names = feature_names + extra_names
+
+    def _extend(vec: np.ndarray) -> np.ndarray:
+        extras = np.concatenate([vec[boost_idx]] * (multiplier - 1))
+        return np.concatenate([vec, extras])
+
+    new_by_year  = {k: _extend(v) for k, v in by_year_team.items()}
+    new_by_team  = {k: _extend(v) for k, v in by_team_hist_mean.items()}
+
+    print(f"✅ Boosted {len(boost_idx)} features x{multiplier}: "
+          f"{[feature_names[i] for i in boost_idx[:5]]}{'...' if len(boost_idx) > 5 else ''}")
+
+    return new_by_year, new_by_team, new_names
+
 # ==========================================
 # MAIN EXECUTION
 # ==========================================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train an XGBoost win-probability model for March Madness.")
-    parser.add_argument("--target_year", type=int, default=2026, help="Year to predict (default: 2026).")
-    parser.add_argument("--predict_round", type=int, default=64, help="Round to predict (64=Round of 64, ...). Default: 64")
-    parser.add_argument("--train_start_year", type=int, default=2018, help="First training year (inclusive).")
-    parser.add_argument("--train_end_year", type=int, default=2024, help="Last training year (inclusive).")
-    parser.add_argument("--test_year", type=int, default=2025, help="Year to hold out for accuracy testing.")
-    parser.add_argument("--no_plot", action="store_true", help="Disable matplotlib plotting.")
+    parser = argparse.ArgumentParser(description="Train a Random Forest win-probability model for March Madness.")
+    parser.add_argument("--target_year", type=int, default=2026)
+    parser.add_argument("--predict_round", type=int, default=64)
+    parser.add_argument("--train_start_year", type=int, default=2018)
+    parser.add_argument("--train_end_year", type=int, default=2025)
+    parser.add_argument("--test_year", type=int, default=2025)
+    parser.add_argument("--no_plot", action="store_true")
     args = parser.parse_args()
 
-    # Safety check
     if args.train_start_year < 2018:
-        print("⚠️ Override: Forcing train_start_year to 2018 to exclude pre-2018 data.")
+        print("⚠️ Override: Forcing train_start_year to 2018.")
         args.train_start_year = 2018
 
     z_path = DATASET_DIR / "Z Rating Teams.csv"
     tm_path = DATASET_DIR / "Tournament Matchups.csv"
-    
     games = load_games_from_tournament_matchups(tm_path)
 
-    # Separate years into Training and Testing sets
     all_years = list(range(args.train_start_year, args.train_end_year + 1))
     train_years = [y for y in all_years if y != args.test_year]
     test_years = [args.test_year]
 
     print(f"Loading features...")
     print(f"Training on years: {train_years}")
-    print(f"Testing on year: {test_years}")
+    print(f"Testing on year:   {test_years}")
 
-    by_year_team, by_team_mean, feature_names = load_team_feature_store(DATASET_DIR, years=all_years, hist_years=train_years)
+    by_year_team, by_team_mean, feature_names = load_team_feature_store(
+        DATASET_DIR, years=all_years, hist_years=train_years
+    )
     by_year_team, by_team_mean, feature_names = drop_high_missing_features(
         by_year_team, by_team_mean, feature_names, max_missing_frac=0.60
     )
+    by_year_team, by_team_mean, feature_names = boost_priority_features(
+        by_year_team, by_team_mean, feature_names,
+        priority_keywords=["KenPom", "Barttorvik", "KADJ", "BADJ"],
+        multiplier=3,
+    )
     z_seeds = load_z_ratings(z_path)
 
-    # Helper function to build X, y matrices dynamically for Train vs. Test
-    def build_matrix(target_years):
+    # ---- build_matrix with mirror augmentation ----
+    def build_matrix(target_years, augment: bool = False):
         X_list, y_list = [], []
         for g in games:
             if g.year not in target_years:
                 continue
             if g.score_a is None or g.score_b is None or g.score_a == g.score_b:
                 continue
-
             va = _vec_for_team_name(g.team_a, g.year, by_year_team, by_team_mean)
             vb = _vec_for_team_name(g.team_b, g.year, by_year_team, by_team_mean)
             if va is None or vb is None:
                 continue
-
             fa = z_seeds.get((g.year, g.team_no_a))
             fb = z_seeds.get((g.year, g.team_no_b))
-            seed_adv = float(fb.seed - fa.seed) if (fa is not None and fb is not None) else 0.0
-
-            x = np.concatenate([va - vb, np.array([seed_adv], dtype=np.float64)], axis=0)
-            y = 1 if g.score_a > g.score_b else 0
+            seed_adv = float(fb.seed - fa.seed) if (fa and fb) else 0.0
+            diff = va - vb
+            x  = np.concatenate([diff,  np.array([ seed_adv], dtype=np.float64)])
+            y  = 1 if g.score_a > g.score_b else 0
             X_list.append(x)
             y_list.append(y)
-            
+            if augment:
+                # Mirror: swap team order — negate diff & seed_adv, flip label
+                x_mir = np.concatenate([-diff, np.array([-seed_adv], dtype=np.float64)])
+                X_list.append(x_mir)
+                y_list.append(1 - y)
         if not X_list:
-            return np.empty((0, len(feature_names)+1)), np.empty(0)
-        return np.stack(X_list, axis=0), np.array(y_list, dtype=np.int32)
+            return np.empty((0, len(feature_names) + 1)), np.empty(0)
+        return np.stack(X_list), np.array(y_list, dtype=np.int32)
 
-    # 1. Build Training Data
-    X_train, y_train = build_matrix(train_years)
+    # ---- 1. Tune hyperparams on augmented training data ----
+    X_train, y_train = build_matrix(train_years, augment=True)
     if len(X_train) < 50:
-        raise SystemExit(f"Not enough training games found ({len(X_train)}).")
+        raise SystemExit(f"Not enough training games ({len(X_train)}).")
 
     X_train, col_means = impute_nan_with_col_means(X_train)
     mu, sigma = standardize_fit(X_train)
     Xs_train = standardize_apply(X_train, mu, sigma)
 
-    # 2. Train and Fine-Tune the XGBoost Model
-    print("\nStarting Heavy Fine-Tuning (This might take a few minutes)...")
-
+    print("\nStarting Hyperparameter Tuning...")
     param_grid = {
-    'n_estimators':      [100, 150, 200],          # stable, keep
-    'max_depth':         [3, 4, 5],                # back down, 6-10 was too deep
-    'min_samples_split': [15, 20, 30, 40],         # back up, need to block spurious splits
-    'min_samples_leaf':  [8, 12, 16, 20],          # back up significantly
-    'max_features':      ['sqrt', 0.2, 0.25, 0.3], # back down, high feature access = memorization
-    'max_samples':       [0.5, 0.6, 0.7],          # back down, less data per tree = less memorization
-    'bootstrap':         [True],
+        'n_estimators':      [100, 150, 200],
+        'max_depth':         [4, 5, 6],
+        'min_samples_split': [8, 12, 16],
+        'min_samples_leaf':  [4, 6, 8],
+        'max_features':      ['sqrt', 0.3, 0.4],
+        'max_samples':       [0.6, 0.7, 0.8],
+        'bootstrap':         [True],
     }
-
-    rf_base = RandomForestClassifier(random_state=42)
-
     random_search = RandomizedSearchCV(
-        estimator=rf_base,
+        RandomForestClassifier(random_state=42),
         param_distributions=param_grid,
-        n_iter=150,
-        scoring='neg_brier_score',
-        cv=5,
-        verbose=1,
-        random_state=42,
-        n_jobs=-1
+        n_iter=150, scoring='neg_brier_score',
+        cv=5, verbose=1, random_state=42, n_jobs=-1
     )
-
     random_search.fit(Xs_train, y_train)
-
-    print(f"\n--- FINE-TUNING COMPLETE ---")
-    print(f"Best Parameters Found: {random_search.best_params_}")
+    best_params = random_search.best_params_
+    print(f"\n--- TUNING COMPLETE ---")
+    print(f"Best Parameters: {best_params}")
 
     model = random_search.best_estimator_
+    p_train = model.predict_proba(Xs_train)[:, 1]
+    train_acc = np.mean((p_train >= 0.5).astype(int) == y_train)
+    print(f"\nTrained on {len(y_train)} games (with mirroring).")
+    print(f"Training Accuracy: {train_acc*100:.2f}% | Brier: {brier_score(p_train, y_train):.4f}")
 
-    # --- Learning Curve: n_estimators vs Train/Test Accuracy ---
-    print("\nGenerating n_estimators learning curve...")
+    # ---- 2. Feature importance report ----
+    analyzer = FeatureAnalyzer(feature_names, model.feature_importances_)
+    analyzer.print_report(min_relative_importance=0.5)
 
-    X_test_imputed_lc = np.where(np.isnan(build_matrix(test_years)[0]), col_means[None, :], build_matrix(test_years)[0])
-    Xs_test_lc = standardize_apply(X_test_imputed_lc, mu, sigma)
-    _, y_test_lc = build_matrix(test_years)
+    # ---- 3. Single held-out year test ----
+    X_test, y_test = build_matrix(test_years, augment=False)  # no augment on test
+    if len(y_test) > 0:
+        X_test_imp = np.where(np.isnan(X_test), col_means[None, :], X_test)
+        Xs_test = standardize_apply(X_test_imp, mu, sigma)
+        p_test = model.predict_proba(Xs_test)[:, 1]
+        test_acc = np.mean((p_test >= 0.5).astype(int) == y_test)
+        print(f"Held-out {args.test_year}: {len(y_test)} games | "
+              f"Accuracy: {test_acc*100:.2f}% | Brier: {brier_score(p_test, y_test):.4f}\n")
 
-    best_params = random_search.best_params_.copy()
+    # ---- 4. Leave-One-Year-Out CV for reliable accuracy estimate ----
+    print("=" * 55)
+    print("   LEAVE-ONE-YEAR-OUT CROSS VALIDATION")
+    print("=" * 55)
+    loyo_accs = []
+    for test_yr in sorted(all_years):
+        tr_yrs = [y for y in all_years if y != test_yr]
+        X_tr, y_tr = build_matrix(tr_yrs, augment=True)
+        X_te, y_te = build_matrix([test_yr], augment=False)
+        if len(y_te) == 0:
+            continue
+        X_tr, cm = impute_nan_with_col_means(X_tr)
+        mu_l, sigma_l = standardize_fit(X_tr)
+        Xs_tr = standardize_apply(X_tr, mu_l, sigma_l)
+        X_te = np.where(np.isnan(X_te), cm[None, :], X_te)
+        Xs_te = standardize_apply(X_te, mu_l, sigma_l)
+        m_l = RandomForestClassifier(**best_params, random_state=42, n_jobs=-1)
+        m_l.fit(Xs_tr, y_tr)
+        acc = np.mean((m_l.predict_proba(Xs_te)[:, 1] >= 0.5).astype(int) == y_te)
+        loyo_accs.append(acc)
+        print(f"  LOYO {test_yr}: {acc*100:.1f}%  ({len(y_te)} games)")
+    print(f"\n  LOYO Mean Accuracy: {np.mean(loyo_accs)*100:.1f}%")
+    print("=" * 55 + "\n")
+
+    # ---- 5. Learning curve plot ----
+    X_test_lc_raw, y_test_lc = build_matrix(test_years, augment=False)
+    X_test_lc = np.where(np.isnan(X_test_lc_raw), col_means[None, :], X_test_lc_raw)
+    Xs_test_lc = standardize_apply(X_test_lc, mu, sigma)
     estimator_range = list(range(10, best_params.get('n_estimators', 200) + 1, 10))
-
-    train_accs, test_accs = [], []
-
+    train_accs_lc, test_accs_lc = [], []
     lc_model = RandomForestClassifier(
         **{k: v for k, v in best_params.items() if k != 'n_estimators'},
-        warm_start=True,
-        random_state=42,
-        n_jobs=-1
+        warm_start=True, random_state=42, n_jobs=-1
     )
-
     for n in estimator_range:
         lc_model.n_estimators = n
         lc_model.fit(Xs_train, y_train)
-        train_accs.append(np.mean((lc_model.predict_proba(Xs_train)[:, 1] >= 0.5).astype(int) == y_train))
+        train_accs_lc.append(np.mean((lc_model.predict_proba(Xs_train)[:, 1] >= 0.5).astype(int) == y_train))
         if len(y_test_lc) > 0:
-            test_accs.append(np.mean((lc_model.predict_proba(Xs_test_lc)[:, 1] >= 0.5).astype(int) == y_test_lc))
+            test_accs_lc.append(np.mean((lc_model.predict_proba(Xs_test_lc)[:, 1] >= 0.5).astype(int) == y_test_lc))
 
     if not args.no_plot:
         fig2, ax2 = plt.subplots(figsize=(10, 5))
-        ax2.plot(estimator_range, [a * 100 for a in train_accs], label="Train Accuracy", color="#1f77b4", linewidth=2)
-        if test_accs:
-            ax2.plot(estimator_range, [a * 100 for a in test_accs], label=f"Test Accuracy ({args.test_year})", color="#d62728", linewidth=2)
-        ax2.axvline(best_params.get('n_estimators', 200), color="gray", linestyle="--", label=f"Best n_estimators={best_params.get('n_estimators', 200)}")
+        ax2.plot(estimator_range, [a * 100 for a in train_accs_lc], label="Train Accuracy", color="#1f77b4", linewidth=2)
+        if test_accs_lc:
+            ax2.plot(estimator_range, [a * 100 for a in test_accs_lc], label=f"Test Accuracy ({args.test_year})", color="#d62728", linewidth=2)
+        ax2.axvline(best_params.get('n_estimators', 200), color="gray", linestyle="--",
+                    label=f"Best n_estimators={best_params.get('n_estimators', 200)}")
         ax2.set_xlabel("Number of Trees (n_estimators)")
         ax2.set_ylabel("Accuracy (%)")
         ax2.set_title("Random Forest: n_estimators vs Train/Test Accuracy")
@@ -548,115 +633,86 @@ def main() -> None:
         ax2.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.show()
-    
-    # Get training probabilities and accuracy using the best model
-    p_train = model.predict_proba(Xs_train)[:, 1]
-    train_acc = np.mean((p_train >= 0.5).astype(int) == y_train)
-    
-    print(f"\nTrained on {len(y_train)} games.")
-    print(f"Training Accuracy: {train_acc*100:.2f}% | Brier score: {brier_score(p_train, y_train):.4f}")
 
-    # 3. Analyze Features via Tree Importances
-    analyzer = FeatureAnalyzer(feature_names, model.feature_importances_)
-    analyzer.print_report(min_relative_importance=0.5) 
+    # ---- 6. Retrain on ALL years including test_year for final 2026 predictions ----
+    print(f"Retraining on ALL years {all_years} for final {args.target_year} predictions...")
+    X_full, y_full = build_matrix(all_years, augment=True)
+    X_full, col_means_full = impute_nan_with_col_means(X_full)
+    mu_full, sigma_full = standardize_fit(X_full)
+    Xs_full = standardize_apply(X_full, mu_full, sigma_full)
+    final_model = RandomForestClassifier(**best_params, random_state=42, n_jobs=-1)
+    final_model.fit(Xs_full, y_full)
+    p_full = final_model.predict_proba(Xs_full)[:, 1]
+    print(f"Final model trained on {len(y_full)} games (with mirroring).")
+    print(f"Full-data Train Accuracy: {np.mean((p_full >= 0.5).astype(int) == y_full)*100:.2f}%\n")
 
-    # 4. Test the Model on the Hold-Out Year (2025)
-    X_test, y_test = build_matrix(test_years)
-    if len(y_test) > 0:
-        X_test_imputed = np.where(np.isnan(X_test), col_means[None, :], X_test)
-        Xs_test = standardize_apply(X_test_imputed, mu, sigma)
-        
-        p_test = model.predict_proba(Xs_test)[:, 1]
-        test_acc = np.mean((p_test >= 0.5).astype(int) == y_test)
-        print(f"Tested on {len(y_test)} unseen games from {args.test_year}.")
-        print(f"Testing Accuracy:  {test_acc*100:.2f}% | Test Brier score: {brier_score(p_test, y_test):.4f}\n")
-    else:
-        print(f"No test games found for {args.test_year}.\n")
-
-    # 5. Predict the 2026 Tournament
+    # ---- 7. Predict the 2026 Tournament using final_model ----
     initial = bracket_2026_round_of_64()
+
+    def _predict_final(team_a, seed_a, team_b, seed_b):
+        return _predict_matchup_prob(
+            team_a, seed_a, team_b, seed_b, args.target_year,
+            by_year_team, by_team_mean, feature_names,
+            mu_full, sigma_full, final_model,
+        )
 
     def _run_region(region_name: str, matchups: list[BracketMatchup]):
         nonlocal all_games, region_champions
-        cur_games: list[tuple[str, int, str, int]] = [(m.team_a, m.seed_a, m.team_b, m.seed_b) for m in matchups]
+        cur_games = [(m.team_a, m.seed_a, m.team_b, m.seed_b) for m in matchups]
         round_labels = ["Round of 64", "Round of 32", "Sweet 16", "Elite 8"]
         round_idx = 0
-
         while True:
             label = round_labels[round_idx] if round_idx < len(round_labels) else f"Round {round_idx+1}"
-            winners: list[tuple[str, int]] = []
+            winners = []
             for team_a, seed_a, team_b, seed_b in cur_games:
-                p_a = _predict_matchup_prob(
-                    team_a, seed_a, team_b, seed_b, args.target_year,
-                    by_year_team, by_team_mean, feature_names, mu, sigma, model,
-                )
+                p_a = _predict_final(team_a, seed_a, team_b, seed_b)
                 winner, w_seed = (team_a, seed_a) if p_a >= 0.5 else (team_b, seed_b)
                 all_games.append((label, region_name, team_a, team_b, p_a, winner))
                 winners.append((winner, w_seed))
-
             if len(winners) == 1:
                 region_champions[region_name] = winners[0]
                 break
-
-            next_games: list[tuple[str, int, str, int]] = []
-            for i in range(0, len(winners), 2):
-                (ta, sa) = winners[i]
-                (tb, sb) = winners[i + 1]
-                next_games.append((ta, sa, tb, sb))
-            cur_games = next_games
+            cur_games = [(winners[i][0], winners[i][1], winners[i+1][0], winners[i+1][1])
+                         for i in range(0, len(winners), 2)]
             round_idx += 1
 
     all_games: list[tuple[str, str, str, str, float, str]] = []
     region_champions: dict[str, tuple[str, int]] = {}
     by_region: dict[str, list[BracketMatchup]] = {}
-    
     for m in initial:
         by_region.setdefault(m.region, []).append(m)
-
     for region_name, matchups in sorted(by_region.items()):
         _run_region(region_name, matchups)
 
-    # Final Four and Championship.
-    def _ff_game(region1: str, region2: str, slot_name: str):
-        nonlocal all_games
-        (team_a, seed_a) = region_champions[region1]
-        (team_b, seed_b) = region_champions[region2]
-        p_a = _predict_matchup_prob(
-            team_a, seed_a, team_b, seed_b, args.target_year,
-            by_year_team, by_team_mean, feature_names, mu, sigma, model,
-        )
-        winner, _ = (team_a, seed_a) if p_a >= 0.5 else (team_b, seed_b)
+    def _ff_game(region1, region2, slot_name):
+        team_a, seed_a = region_champions[region1]
+        team_b, seed_b = region_champions[region2]
+        p_a = _predict_final(team_a, seed_a, team_b, seed_b)
+        winner = team_a if p_a >= 0.5 else team_b
         all_games.append(("Final Four", slot_name, team_a, team_b, p_a, winner))
         return winner
 
-    west_east_winner = _ff_game("EAST", "WEST", "EAST/WEST")
-    south_midwest_winner = _ff_game("SOUTH", "MIDWEST", "SOUTH/MIDWEST")
+    ew = _ff_game("EAST", "WEST", "EAST/WEST")
+    sm = _ff_game("SOUTH", "MIDWEST", "SOUTH/MIDWEST")
 
-    def _find_seed(team_name: str) -> int:
+    def _find_seed(name):
         for _, (t, s) in region_champions.items():
-            if t == team_name:
+            if t == name:
                 return s
         return 1
 
-    seed_a = _find_seed(west_east_winner)
-    seed_b = _find_seed(south_midwest_winner)
-    p_a_final = _predict_matchup_prob(
-        west_east_winner, seed_a, south_midwest_winner, seed_b, args.target_year,
-        by_year_team, by_team_mean, feature_names, mu, sigma, model,
-    )
-    champ_winner = west_east_winner if p_a_final >= 0.5 else south_midwest_winner
-    all_games.append(("Championship", "NATIONAL", west_east_winner, south_midwest_winner, p_a_final, champ_winner))
+    p_final = _predict_final(ew, _find_seed(ew), sm, _find_seed(sm))
+    champ = ew if p_final >= 0.5 else sm
+    all_games.append(("Championship", "NATIONAL", ew, sm, p_final, champ))
 
-    # Output formatting
-    round_order = {"Round of 64": 1, "Round of 32": 2, "Sweet 16": 3, "Elite 8": 4, "Final Four": 5, "Championship": 6}
+    round_order = {"Round of 64": 1, "Round of 32": 2, "Sweet 16": 3,
+                   "Elite 8": 4, "Final Four": 5, "Championship": 6}
     all_games.sort(key=lambda t: (round_order.get(t[0], 99), t[1], -abs(t[4] - 0.5), t[2]))
 
     print(f"=======================================================")
     print(f"   PREDICTING THE FULL {args.target_year} TOURNAMENT")
     print(f"=======================================================")
-    
-    cur_round = None
-    cur_region = None
+    cur_round = cur_region = None
     for round_label, region, team_a, team_b, p_a, winner in all_games:
         if round_label != cur_round:
             cur_round = round_label
@@ -665,26 +721,24 @@ def main() -> None:
         if region != cur_region:
             cur_region = region
             print(f"\n[{region}]")
-        print(f"- {team_a} vs {team_b}: {100.0*p_a:5.1f}% / {100.0*(1.0-p_a):5.1f}% (winner: {winner})")
+        print(f"- {team_a} vs {team_b}: {100*p_a:5.1f}% / {100*(1-p_a):5.1f}% (winner: {winner})")
 
     if args.no_plot:
         return
 
     top_games = sorted(all_games, key=lambda t: -abs(t[4] - 0.5))[:32]
-    labels = [f"{round_label} / {region}: {team_a} vs {team_b}" for (round_label, region, team_a, team_b, _, _) in top_games]
-    probs = np.array([p for (_, _, _, _, p, _) in top_games], dtype=np.float64)
-
-    fig_h = max(8.0, 0.28 * len(labels) + 1.5)
+    labels = [f"{rl} / {rg}: {ta} vs {tb}" for (rl, rg, ta, tb, _, _) in top_games]
+    probs  = np.array([p for (_, _, _, _, p, _) in top_games])
+    fig_h  = max(8.0, 0.28 * len(labels) + 1.5)
     fig, ax = plt.subplots(figsize=(12, fig_h))
-    y_pos = np.arange(len(labels))
-    ax.barh(y_pos, probs, color="#1f77b4")
+    ax.barh(np.arange(len(labels)), probs, color="#1f77b4")
     ax.axvline(0.5, color="black", linewidth=1)
-    ax.set_yticks(y_pos)
+    ax.set_yticks(np.arange(len(labels)))
     ax.set_yticklabels(labels, fontsize=9)
     ax.invert_yaxis()
     ax.set_xlim(0, 1)
     ax.set_xlabel("P(Team A wins)")
-    ax.set_title(f"Predicted win probabilities — {args.target_year} Round {args.predict_round} (top {len(labels)})")
+    ax.set_title(f"Predicted win probabilities — {args.target_year} (top {len(labels)})")
     plt.tight_layout()
     plt.show()
 
