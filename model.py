@@ -9,7 +9,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.linear_model import LogisticRegressionCV
+from sklearn.linear_model import LogisticRegression,LogisticRegressionCV
 from sklearn.model_selection import GroupKFold
 
 DATASET_DIR = Path(__file__).resolve().parent / "dataset"
@@ -304,7 +304,7 @@ def bracket_2026_round_of_64() -> list[BracketMatchup]:
     return [
         BracketMatchup("EAST", 1, "Duke", 16, "Siena"),
         BracketMatchup("EAST", 8, "Ohio St.", 9, "TCU"),
-        BracketMatchup("EAST", 5, "St. John's", 12, "North Texas"),
+        BracketMatchup("EAST", 5, "St. John's", 12, "Northern Iowa"),
         BracketMatchup("EAST", 4, "Kansas", 13, "Cal Baptist"),
         BracketMatchup("EAST", 6, "Louisville", 11, "South Florida"),
         BracketMatchup("EAST", 3, "Michigan St.", 14, "North Dakota St."),
@@ -425,6 +425,42 @@ def log_loss_binary(p: np.ndarray, y: np.ndarray) -> float:
     p = np.clip(p, 1e-9, 1.0 - 1e-9)
     return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
 
+def safe_logit(p: np.ndarray) -> np.ndarray:
+    p = np.clip(np.asarray(p, dtype=np.float64), 1e-9, 1.0 - 1e-9)
+    return np.log(p / (1.0 - p))
+
+
+def fit_platt_calibrator(
+    p_val: np.ndarray,
+    y_val: np.ndarray,
+    sample_weight: np.ndarray | None = None,
+) -> LogisticRegression:
+    """
+    Fit a Platt-scaling calibrator on validation probabilities.
+    Input is raw model probability -> transformed by logit -> calibrated probability.
+    """
+    z_val = safe_logit(p_val).reshape(-1, 1)
+
+    calibrator = LogisticRegression(
+        penalty="l2",
+        C=1e6,              # effectively unregularized for 1D Platt scaling
+        solver="lbfgs",
+        max_iter=2000,
+        random_state=42,
+    )
+    if sample_weight is not None and len(sample_weight) == len(y_val):
+        calibrator.fit(z_val, y_val, sample_weight=sample_weight)
+    else:
+        calibrator.fit(z_val, y_val)
+    return calibrator
+
+
+def apply_platt_calibration(
+    p: np.ndarray,
+    calibrator: LogisticRegression,
+) -> np.ndarray:
+    z = safe_logit(p).reshape(-1, 1)
+    return calibrator.predict_proba(z)[:, 1]
 
 def impute_nan_with_col_means(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     with warnings.catch_warnings():
@@ -513,13 +549,17 @@ def source_weight_for_feature(
 ) -> float:
     name_u = feature_name.upper()
 
+    # ---- Base source weight ----
     if "KENPOM BARTTORVIK::" in name_u:
-        return kenpom_weight
-    if "Z RATING TEAMS::" in name_u:
-        return zrating_weight
-    if "TEAMRANKINGS::" in name_u:
-        return teamrankings_weight
-    return other_source_weight
+        weight = kenpom_weight
+    elif "Z RATING TEAMS::" in name_u:
+        weight = zrating_weight
+    elif "TEAMRANKINGS::" in name_u:
+        weight = teamrankings_weight
+    else:
+        weight = other_source_weight
+ 
+    return weight
 
 def build_matchup_feature_vector(
     va: np.ndarray,
@@ -678,6 +718,7 @@ def _predict_matchup_prob(
     mu: np.ndarray,
     sigma: np.ndarray,
     lr_model: LogisticRegressionCV,
+    calibrator: LogisticRegression,
     keep_idx: np.ndarray,
     kenpom_weight: float,
     zrating_weight: float,
@@ -709,7 +750,13 @@ def _predict_matchup_prob(
     x = np.where(np.isnan(x), 0.0, x)
     x = x[keep_idx]
     xs = standardize_apply(x[None, :], mu, sigma)
-    return float(lr_model.predict_proba(xs)[0, 1])
+
+    p_raw = float(lr_model.predict_proba(xs)[0, 1])
+
+    if calibrator is not None:
+        return float(apply_platt_calibration(np.array([p_raw]), calibrator)[0])
+    else:
+        return p_raw
 
 
 # ==========================================
@@ -725,14 +772,15 @@ def main() -> None:
     parser.add_argument("--test_year", type=int, default=0, help="True holdout year. Set to 0 to skip holdout evaluation.")
     parser.add_argument("--max_missing_frac", type=float, default=0.60, help="Drop features missing above this fraction.")
     parser.add_argument("--corr_prune_threshold", type=float, default=0.985, help="Drop train-only highly correlated features above this absolute correlation.")
-    parser.add_argument("--use_feature_whitelist", action="store_true", help="Keep only selected metric families before matchup construction.")
-    parser.add_argument("--use_weights", action="store_true", help="Use custom sample weights.")
+    parser.add_argument("--use_feature_whitelist", action="store_true", default=True,help="Keep only selected metric families before matchup construction.")
+    parser.add_argument("--use_weights", action="store_true", default=False,help="Use custom sample weights.")
+    parser.add_argument("--use_calibration", action="store_true", default=False,help="Apply Platt probability calibration.")
     parser.add_argument("--penalty", choices=["l1", "l2"], default="l2", help="Logistic penalty.")
     parser.add_argument("--no_plot", action="store_true", help="Disable plotting.")
-    parser.add_argument("--kenpom_weight", type=float, default=1.75, help="Weight multiplier for KenPom/Barttorvik features.")
-    parser.add_argument("--zrating_weight", type=float, default=1.20, help="Weight multiplier for Z Rating features.")
-    parser.add_argument("--teamrankings_weight", type=float, default=0.60, help="Weight multiplier for TeamRankings features.")
-    parser.add_argument("--other_source_weight", type=float, default=0.35, help="Weight multiplier for other feature sources.")
+    parser.add_argument("--kenpom_weight", type=float, default=1.00, help="Weight multiplier for KenPom/Barttorvik features.")
+    parser.add_argument("--zrating_weight", type=float, default=1.00, help="Weight multiplier for Z Rating features.")
+    parser.add_argument("--teamrankings_weight", type=float, default=1.00, help="Weight multiplier for TeamRankings features.")
+    parser.add_argument("--other_source_weight", type=float, default=1.00, help="Weight multiplier for other feature sources.")
     args = parser.parse_args()
 
     if args.val_year != args.train_end_year + 1:
@@ -776,28 +824,16 @@ def main() -> None:
     if args.use_feature_whitelist:
         allowed_metric_substrings = [
             "Z RATING",
-            "SEED",
-            "BADJ EM",
-            "KADJ EM",
-            "BADJ O",
-            "KADJ O",
-            "BADJ D",
-            "KADJ D",
+            "BADJ EM", "KADJ EM",
+            "BADJ O", "KADJ O",
+            "BADJ D", "KADJ D",
             "WAB",
             "TR RATING",
             "SOS",
             "WIN%",
-            "V 1-25 WINS",
-            "TOP 25",
-            "Q1",
-            "Q2",
-            "3PT",
-            "3PTR",
-            "3PTD",
+            "3PT", "3PTD",
             "TOV",
-            "OREB",
-            "DREB",
-            "REB",
+            "OREB", "DREB",
             "FTR",
             "PPPO",
             "TALENT",
@@ -980,12 +1016,32 @@ def main() -> None:
         refit=True,
         n_jobs=n_jobs,
     )
+    
     lr_model.fit(Xs_train, y_train, sample_weight=w_train)
 
-    p_train = lr_model.predict_proba(Xs_train)[:, 1]
-    p_val = lr_model.predict_proba(Xs_val)[:, 1]
+    # Raw probabilities from the base logistic model
+    p_train_raw = lr_model.predict_proba(Xs_train)[:, 1]
+    p_val_raw = lr_model.predict_proba(Xs_val)[:, 1]
     if args.test_year != 0:
-        p_test = lr_model.predict_proba(Xs_test)[:, 1]
+        p_test_raw = lr_model.predict_proba(Xs_test)[:, 1]
+
+    if args.use_calibration:
+        calibrator = fit_platt_calibrator(
+            p_val_raw,
+            y_val,
+            sample_weight=w_val if args.use_weights else None,
+        )
+
+        p_train = apply_platt_calibration(p_train_raw, calibrator)
+        p_val = apply_platt_calibration(p_val_raw, calibrator)
+        if args.test_year != 0:
+            p_test = apply_platt_calibration(p_test_raw, calibrator)
+    else:
+        calibrator = None
+        p_train = p_train_raw
+        p_val = p_val_raw
+        if args.test_year != 0:
+            p_test = p_test_raw
 
     print(f"\nTrained on {len(y_train)} examples.")
     print(f"Validation examples: {len(y_val)}")
@@ -997,6 +1053,14 @@ def main() -> None:
     print(f"Penalty: {args.penalty}")
     print(f"Whitelist enabled: {args.use_feature_whitelist}")
     print(f"Custom weights enabled: {args.use_weights}")
+    print("\n--- RAW VALIDATION METRICS (before calibration) ---")
+    print(f"Val Accuracy Raw: {accuracy_from_probs(p_val_raw, y_val)*100:.2f}%")
+    print(f"Val Brier Raw:    {brier_score(p_val_raw, y_val):.4f}")
+    print(f"Val LogLoss Raw:  {log_loss_binary(p_val_raw, y_val):.4f}")
+    print("\n--- CALIBRATED VALIDATION METRICS ---")
+    print(f"Val Accuracy Cal: {accuracy_from_probs(p_val, y_val)*100:.2f}%")
+    print(f"Val Brier Cal:    {brier_score(p_val, y_val):.4f}")
+    print(f"Val LogLoss Cal:  {log_loss_binary(p_val, y_val):.4f}")
 
     print("\n--- TRAIN METRICS ---")
     print(f"Train Accuracy: {accuracy_from_probs(p_train, y_train)*100:.2f}%")
@@ -1007,6 +1071,12 @@ def main() -> None:
     print(f"Val Accuracy: {accuracy_from_probs(p_val, y_val)*100:.2f}%")
     print(f"Val Brier:    {brier_score(p_val, y_val):.4f}")
     print(f"Val LogLoss:  {log_loss_binary(p_val, y_val):.4f}")
+
+    if args.test_year != 0:
+        print("\n--- RAW TEST METRICS (before calibration) ---")
+        print(f"Test Accuracy Raw: {accuracy_from_probs(p_test_raw, y_test)*100:.2f}%")
+        print(f"Test Brier Raw:    {brier_score(p_test_raw, y_test):.4f}")
+        print(f"Test LogLoss Raw:  {log_loss_binary(p_test_raw, y_test):.4f}")
 
     if args.test_year != 0:
         print("\n--- TEST METRICS (TRUE HOLDOUT) ---")
@@ -1050,6 +1120,7 @@ def main() -> None:
                     mu,
                     sigma,
                     lr_model,
+                    calibrator,
                     keep_idx,
                     kenpom_weight=args.kenpom_weight,
                     zrating_weight=args.zrating_weight,
@@ -1101,6 +1172,7 @@ def main() -> None:
             mu,
             sigma,
             lr_model,
+            calibrator,
             keep_idx,
             kenpom_weight=args.kenpom_weight,
             zrating_weight=args.zrating_weight,
@@ -1137,6 +1209,7 @@ def main() -> None:
         mu,
         sigma,
         lr_model,
+        calibrator,
         keep_idx,
         kenpom_weight=args.kenpom_weight,
         zrating_weight=args.zrating_weight,
